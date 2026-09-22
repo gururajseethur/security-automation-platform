@@ -70,7 +70,7 @@ work can be automated without giving up auditability?
 These are the choices worth arguing about in a review, so they're stated plainly:
 
 - **Authentication** — JWT on every `/api/v1/*` route, 8-hour expiry, RS256-ready.
-- **Webhook integrity**  HMAC-SHA256 signature verification on every inbound webhook.
+- **Webhook integrity** — HMAC-SHA256 signature verification on every inbound webhook.
   An unsigned webhook endpoint is an unauthenticated RPC into your SOC.
 - **Rate limiting** — 60 rpm general, 5 rpm on auth, 100 rpm on webhooks.
 - **Tenant isolation** — `tenant_id` on 18 core tables; every query filters on it, and

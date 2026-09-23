@@ -1,0 +1,177 @@
+{
+  "name": "\ud83c\udf10 NET-04 | VPN Anomaly & Step-Up Auth",
+  "nodes": [
+    {
+      "id": "n4-wh",
+      "name": "VPN Login Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "network/vpn-login",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "n4-analyse",
+      "name": "Detect VPN Anomaly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst HIGH_RISK_COUNTRIES=['CN','RU','KP','IR','BY'];\nconst OFFICE_HOURS={start:8,end:20};\nconst hour=new Date().getHours();\nconst country=evt.geo_country||evt.country||'';\nconst is_hr=hour>=OFFICE_HOURS.start&&hour<=OFFICE_HOURS.end;\nconst is_risky_geo=HIGH_RISK_COUNTRIES.includes(country);\nconst is_concurrent=parseInt(evt.concurrent_sessions||0)>1;\nconst anomalies=[];\nif(is_risky_geo) anomalies.push(`Login from high-risk country: ${country}`);\nif(!is_hr) anomalies.push(`Off-hours login at ${hour}:00 IST`);\nif(is_concurrent) anomalies.push(`${evt.concurrent_sessions} concurrent VPN sessions`);\nconst confidence=is_risky_geo?85:anomalies.length>=2?75:60;\nconst should_mfa=confidence>=70;\nreturn[{json:{username:evt.username||evt.user,src_ip:evt.src_ip,country,anomalies,anomaly_count:anomalies.length,confidence,should_mfa,session_id:evt.session_id||`VPN-${Date.now()}`}}];"
+      }
+    },
+    {
+      "id": "n4-gate",
+      "name": "Anomaly Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-n4-gate",
+              "leftValue": "={{ $json.anomaly_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n4-mfa",
+      "name": "Trigger Okta MFA Step-Up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.okta.domain }}/api/v1/users/{{ $json.username }}/factors/challenge",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"factorType\":\"token:software:totp\"}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=SSWS {{ $credentials.okta.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OKTA_API",
+          "name": "Okta API"
+        }
+      }
+    },
+    {
+      "id": "n4-slack",
+      "name": "VPN Anomaly Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_NETWORK_SEC"
+        },
+        "text": "=\ud83c\udf10 *VPN Anomaly \u2014 {{ $json.confidence }}% Confidence*\n\n*User:* {{ $json.username }}\n*Source:* {{ $json.src_ip }} ({{ $json.country }})\n*Anomalies:*\n{{ $json.anomalies.map(a=>'\u2022 '+a).join('\\n') }}\n*MFA Step-Up:* {{ $json.should_mfa?'\u2705 Triggered':'\u274c Below threshold' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "VPN Login Event": {
+      "main": [
+        [
+          {
+            "node": "Detect VPN Anomaly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect VPN Anomaly": {
+      "main": [
+        [
+          {
+            "node": "Anomaly Detected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anomaly Detected?": {
+      "main": [
+        [
+          {
+            "node": "Trigger Okta MFA Step-Up",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "VPN Anomaly Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "network",
+    "workflow_id": "NET-04",
+    "phase": 2,
+    "description": "Event-driven. Flags VPN logins from unusual geo, unusual hours, or multiple concurrent sessions. Forces MFA step-up."
+  }
+}

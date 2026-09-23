@@ -1,0 +1,225 @@
+{
+  "name": "\u2699\ufe0f DS-01 | SAST/DAST Orchestration Gate",
+  "nodes": [
+    {
+      "id": "ds1-wh",
+      "name": "PR Created Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devsecops/pr-created",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "ds1-extract",
+      "name": "Extract PR Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst pr=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{pr_number:pr.number||pr.pull_request?.number,repo:pr.repository?.full_name||pr.repo,\n  branch:pr.pull_request?.head?.ref||pr.branch,author:pr.pull_request?.user?.login||pr.sender?.login,\n  commit_sha:pr.pull_request?.head?.sha||pr.after,base_url:pr.repository?.html_url||'',\n  scan_id:`SCAN-PR-${Date.now()}`}}];"
+      }
+    },
+    {
+      "id": "ds1-semgrep",
+      "name": "Trigger Semgrep SAST",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        200
+      ],
+      "parameters": {
+        "url": "=https://semgrep.dev/api/v1/deployments/{{ $credentials.semgrepApi.deploymentSlug }}/jobs",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"meta\":{\"commit\":{\"sha\":\"{{ $json.commit_sha }}\"},\"branch\":\"{{ $json.branch }}\"},\"scan_metadata\":{\"scan_id\":\"{{ $json.scan_id }}\"}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.semgrepApi.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SEMGREP_API",
+          "name": "Semgrep API"
+        }
+      }
+    },
+    {
+      "id": "ds1-parse",
+      "name": "Evaluate Scan Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst semgrep=$('Trigger Semgrep SAST').first().json;\nconst pr=$('Extract PR Context').first().json;\n// Parse Semgrep findings\nconst findings=(semgrep.findings||semgrep.results||[]);\nconst critical=findings.filter(f=>f.extra?.severity==='ERROR'||f.severity==='error');\nconst high=findings.filter(f=>f.extra?.severity==='WARNING'||f.severity==='warning');\nconst should_block=critical.length>0;\nreturn[{json:{...pr,semgrep_findings:findings.length,critical_findings:critical.length,\n  high_findings:high.length,should_block,\n  block_reason:should_block?`${critical.length} critical security finding(s) detected`:'No blocking findings'}}];"
+      }
+    },
+    {
+      "id": "ds1-status",
+      "name": "Set GitHub Status Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/statuses/{{ $json.commit_sha }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"state\":\"{{ $json.should_block?'failure':'success' }}\",\"description\":\"{{ $json.should_block?$json.critical_findings+' critical findings \u2014 merge blocked':'No blocking security findings' }}\",\"context\":\"constellation/sast-dast\",\"target_url\":\"https://semgrep.dev\"}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_API",
+          "name": "GitHub API"
+        }
+      }
+    },
+    {
+      "id": "ds1-slack",
+      "name": "SAST Scan Result",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_APPSEC_ALERTS"
+        },
+        "text": "=\u2699\ufe0f *SAST Scan \u2014 PR #{{ $json.pr_number }}*\n\n*Repo:* {{ $json.repo }}\n*Branch:* {{ $json.branch }}\n*Author:* @{{ $json.author }}\n*Critical:* {{ $json.critical_findings }} | *High:* {{ $json.high_findings }}\n*Status:* {{ $json.should_block?'\ud83d\udd34 MERGE BLOCKED':'\u2705 Clear to merge' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "PR Created Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract PR Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PR Context": {
+      "main": [
+        [
+          {
+            "node": "Trigger Semgrep SAST",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Semgrep SAST": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Scan Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Scan Results": {
+      "main": [
+        [
+          {
+            "node": "Set GitHub Status Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set GitHub Status Check": {
+      "main": [
+        [
+          {
+            "node": "SAST Scan Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "devsecops",
+    "workflow_id": "DS-01",
+    "phase": 2,
+    "description": "On PR creation: trigger Semgrep SAST + OWASP ZAP DAST in parallel. Gate merge on critical findings."
+  }
+}

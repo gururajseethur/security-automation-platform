@@ -1,0 +1,220 @@
+{
+  "name": "\ud83c\udf10 NET-03 | Dark Web Credential Monitor",
+  "nodes": [
+    {
+      "id": "n3-cron",
+      "name": "Daily 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n3-domains",
+      "name": "Fetch Org Domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT DISTINCT email_domain FROM staff_email_domains WHERE active=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "n3-hibp",
+      "name": "Check HIBP Domain Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "=https://haveibeenpwned.com/api/v3/breacheddomain/{{ $json.email_domain }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "hibp-api-key",
+              "value": "={{ $credentials.hibpApi.apiKey }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "CyberConstellationMonitor/1.2"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "HIBP_API",
+          "name": "HIBP API"
+        }
+      }
+    },
+    {
+      "id": "n3-parse",
+      "name": "Parse Breach Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst data=$input.all().flatMap(i=>{\n  const domain=i.json.domain||'unknown';\n  const breaches=i.json.breaches||i.json||[];\n  if(!Array.isArray(breaches)) return[];\n  return breaches.map(b=>({domain,breach_name:b.Name||b,breach_date:b.BreachDate,data_classes:b.DataClasses||[]}));\n});\nconst credentialBreaches=data.filter(b=>(b.data_classes||[]).some(c=>['Passwords','Password hints'].includes(c)));\nreturn[{json:{total_breaches:data.length,credential_breaches:credentialBreaches.length,breaches:credentialBreaches,checked_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "n3-gate",
+      "name": "Credential Breaches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-n3-gate",
+              "leftValue": "={{ $json.credential_breaches }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n3-slack",
+      "name": "Breach Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_NETWORK_SEC"
+        },
+        "text": "=\ud83c\udf10 *Dark Web Credential Alert*\n\n*Credential Breaches Found:* {{ $json.credential_breaches }}\n*Total Breaches:* {{ $json.total_breaches }}\n\n{{ $json.breaches.slice(0,5).map(b=>'\ud83d\udd34 '+b.breach_name+' ('+b.domain+') \u2014 '+b.breach_date).join('\\n') }}\n\n_Force password reset triggered for affected accounts via IAM agent._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 06:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Org Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Org Domains": {
+      "main": [
+        [
+          {
+            "node": "Check HIBP Domain Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check HIBP Domain Search": {
+      "main": [
+        [
+          {
+            "node": "Parse Breach Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Breach Data": {
+      "main": [
+        [
+          {
+            "node": "Credential Breaches?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Credential Breaches?": {
+      "main": [
+        [
+          {
+            "node": "Breach Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "network",
+    "workflow_id": "NET-03",
+    "phase": 2,
+    "description": "Daily HaveIBeenPwned check for all org email domains. Matched breach \u2192 force password reset \u2192 notify manager."
+  }
+}

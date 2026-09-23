@@ -1,0 +1,179 @@
+{
+  "name": "\ud83d\udccb GRC-03 | Policy Acknowledgment Tracker",
+  "nodes": [
+    {
+      "id": "g3-wh",
+      "name": "Policy Published",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        200
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "grc/policy-publish",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "g3-staff",
+      "name": "Fetch All Staff",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT employee_id,email,full_name,department,manager_email FROM staff WHERE active=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g3-build",
+      "name": "Create Tracking Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        200
+      ],
+      "parameters": {
+        "jsCode": "\nconst policy=$('Policy Published').first().json;\nconst staff=$input.all().map(i=>i.json);\nconst pid=policy.policy_id||`POL-${Date.now()}`;\nconst deadline=new Date(Date.now()+parseInt(policy.deadline_days||14)*86400000).toISOString();\nreturn staff.map(s=>({json:{\n  tracking_id:`TRK-${pid}-${s.employee_id}`,policy_id:pid,\n  policy_name:policy.policy_name,email:s.email,full_name:s.full_name,\n  department:s.department,manager_email:s.manager_email,\n  deadline,acknowledged:false\n}}));"
+      }
+    },
+    {
+      "id": "g3-cron",
+      "name": "Daily 09:00 Reminder",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        400
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "g3-overdue",
+      "name": "Find Overdue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT pa.*, EXTRACT(DAY FROM pa.deadline-NOW())::INT as days_remaining\nFROM policy_acknowledgments pa\nWHERE pa.acknowledged=false\n  AND EXTRACT(DAY FROM NOW()-pa.sent_at) IN (7,3,1,0)\nORDER BY pa.deadline;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g3-slack",
+      "name": "Escalation Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        640,
+        400
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GRC"
+        },
+        "text": "\ud83d\udccb *Policy Acknowledgment Status*\n\n*Overdue / Due Soon:* {{ $input.all().length }} staff\n{{ $input.all().slice(0,5).map(i=>i.json).map(s=>'\u2022 '+s.full_name+' ('+s.department+') \u2014 '+s.days_remaining+'d remaining').join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Policy Published": {
+      "main": [
+        [
+          {
+            "node": "Fetch All Staff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch All Staff": {
+      "main": [
+        [
+          {
+            "node": "Create Tracking Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 09:00 Reminder": {
+      "main": [
+        [
+          {
+            "node": "Find Overdue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Overdue": {
+      "main": [
+        [
+          {
+            "node": "Escalation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "grc",
+    "workflow_id": "GRC-03",
+    "phase": 1,
+    "description": "On policy publish: creates per-employee tracking. Daily 09:00 checks for overdue. Escalates to manager at 7d/3d/1d before deadline."
+  }
+}

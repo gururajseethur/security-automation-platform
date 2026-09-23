@@ -1,0 +1,207 @@
+{
+  "name": "\u2699\ufe0f DS-06 | SBOM Generator & Diff Tracker",
+  "nodes": [
+    {
+      "id": "ds6-wh",
+      "name": "Release Tag Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devsecops/release-tag",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "ds6-extract",
+      "name": "Extract Release Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst rel=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{repo:rel.repository?.full_name||rel.repo,tag:rel.ref?.replace('refs/tags/',''),\n  commit:rel.after||rel.head_commit?.id,release_id:`SBOM-${Date.now()}`,\n  created_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "ds6-generate",
+      "name": "Generate SBOM (Syft)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// Production: exec syft {repo}:{tag} -o cyclonedx-json\n// syft outputs standard CycloneDX JSON format\n// Mock SBOM structure:\nconst ctx=$input.first().json;\nconst sbom={\n  bomFormat:'CycloneDX',specVersion:'1.4',\n  serialNumber:`urn:uuid:${ctx.release_id}`,\n  metadata:{component:{name:ctx.repo,version:ctx.tag,type:'application'},\n    timestamp:ctx.created_at,tools:[{name:'Syft',version:'0.90.0'}]},\n  components:[\n    {type:'library',name:'express',version:'4.18.2',purl:'pkg:npm/express@4.18.2'},\n    {type:'library',name:'lodash',version:'4.17.21',purl:'pkg:npm/lodash@4.17.21'},\n  ]\n};\nreturn[{json:{...ctx,sbom,component_count:sbom.components.length}}];"
+      }
+    },
+    {
+      "id": "ds6-save",
+      "name": "Store SBOM",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sbom_registry (release_id,repo,tag,commit_sha,component_count,sbom_json,created_at) VALUES ('RID','repo','v1','sha',0,'{}',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ds6-prev",
+      "name": "Fetch Previous SBOM",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT component_count,sbom_json FROM sbom_registry WHERE repo='placeholder' ORDER BY created_at DESC LIMIT 2;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ds6-diff",
+      "name": "Diff SBOMs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst current=$('Generate SBOM (Syft)').first().json;\nconst prev_rows=$('Fetch Previous SBOM').all();\nconst prev_sbom=prev_rows.length>1?JSON.parse(prev_rows[1].json.sbom_json||'{}'):null;\nif(!prev_sbom) return[{json:{...current,diff:{added:[],removed:[],changed:[]},is_first_release:true}}];\nconst prev_pkgs=new Set((prev_sbom.components||[]).map(c=>c.purl));\nconst curr_pkgs=new Set(current.sbom.components.map(c=>c.purl));\nconst added=[...curr_pkgs].filter(p=>!prev_pkgs.has(p));\nconst removed=[...prev_pkgs].filter(p=>!curr_pkgs.has(p));\nreturn[{json:{...current,diff:{added,removed,added_count:added.length,removed_count:removed.length},has_changes:added.length>0||removed.length>0}}];"
+      }
+    },
+    {
+      "id": "ds6-slack",
+      "name": "SBOM Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_APPSEC_ALERTS"
+        },
+        "text": "=\u2699\ufe0f *SBOM Generated \u2014 {{ $json.repo }}@{{ $json.tag }}*\n\n*Components:* {{ $json.component_count }}\n*New Dependencies:* {{ $json.diff?.added_count||0 }}\n*Removed:* {{ $json.diff?.removed_count||0 }}\n\n{{ ($json.diff?.added_count||0)>0?'*New packages:*\\n'+($json.diff?.added||[]).slice(0,5).map(p=>'\u2022 `'+p+'`').join('\\n'):'No dependency changes.' }}\n\n_SBOM stored in constellation SBOM registry._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Release Tag Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Release Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Release Info": {
+      "main": [
+        [
+          {
+            "node": "Generate SBOM (Syft)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate SBOM (Syft)": {
+      "main": [
+        [
+          {
+            "node": "Store SBOM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store SBOM": {
+      "main": [
+        [
+          {
+            "node": "Fetch Previous SBOM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Previous SBOM": {
+      "main": [
+        [
+          {
+            "node": "Diff SBOMs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff SBOMs": {
+      "main": [
+        [
+          {
+            "node": "SBOM Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "devsecops",
+    "workflow_id": "DS-06",
+    "phase": 2,
+    "description": "On release tag: generate SBOM via Syft/CycloneDX. Diff vs previous release. Alert on new high-risk dependencies."
+  }
+}

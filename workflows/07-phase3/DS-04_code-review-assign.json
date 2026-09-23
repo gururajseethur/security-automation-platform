@@ -1,0 +1,247 @@
+{
+  "name": "\u2699\ufe0f DS-04 | Secure Code Review Auto-Assign",
+  "nodes": [
+    {
+      "id": "ds4-wh",
+      "name": "PR Files Changed",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "devsecops/pr-files",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "ds4-classify",
+      "name": "Classify File Risk",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst pr=$input.first().json?.raw_data||$input.first().json;\nconst files=pr.files||pr.pull_request?.changed_files||[];\nconst HIGH_RISK_PATTERNS=[/auth/i,/crypto/i,/password/i,/secret/i,/token/i,/jwt/i,/oauth/i,/session/i,/permission/i,/acl/i,/sql/i,/query/i,/exec/i,/eval/i,/unsafe/i];\nconst HIGH_RISK_EXTENSIONS=['.sql','.env','.pem','.key','.p12','.pfx'];\nconst riskyFiles=[];\nfor(const f of (typeof files==='number'?[]:files)){\n  const fname=typeof f==='string'?f:f.filename||'';\n  const isHighRisk=HIGH_RISK_PATTERNS.some(p=>p.test(fname))||HIGH_RISK_EXTENSIONS.some(e=>fname.endsWith(e));\n  if(isHighRisk) riskyFiles.push(fname);\n}\nconst needs_review=riskyFiles.length>0;\nreturn[{json:{pr_number:pr.number||pr.pull_request?.number,repo:pr.repository?.full_name||pr.repo,\n  author:pr.pull_request?.user?.login||'unknown',risky_files:riskyFiles,\n  needs_appsec_review:needs_review,risk_count:riskyFiles.length}}];"
+      }
+    },
+    {
+      "id": "ds4-gate",
+      "name": "High-Risk Files?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "rf-check",
+              "leftValue": "={{ $json.needs_appsec_review }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ds4-assign",
+      "name": "Request AppSec Reviewer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/pulls/{{ $json.pr_number }}/requested_reviewers",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"reviewers\":[\"appsec-team\"]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_API",
+          "name": "GitHub API"
+        }
+      }
+    },
+    {
+      "id": "ds4-comment",
+      "name": "Post Security Checklist",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/issues/{{ $json.pr_number }}/comments",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"body\":\"## \ud83d\udd10 AppSec Review Required\\n\\nThis PR modifies high-risk files and requires security review.\\n\\n**High-risk files:** `{{ $json.risky_files.join(', ') }}`\\n\\n### Security Checklist\\n- [ ] No hardcoded credentials or secrets\\n- [ ] Input validation on all user-controlled data\\n- [ ] SQL queries use parameterized statements\\n- [ ] Authentication/authorization logic reviewed\\n- [ ] Crypto operations use approved libraries\\n\\n*Assigned to @appsec-team by Constellation DevSecOps Agent*\"}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_API",
+          "name": "GitHub API"
+        }
+      }
+    },
+    {
+      "id": "ds4-slack",
+      "name": "AppSec Review Assigned",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_APPSEC_ALERTS"
+        },
+        "text": "=\u2699\ufe0f *AppSec Review Auto-Assigned*\n\n*PR #{{ $json.pr_number }}* \u2014 {{ $json.repo }}\n*Author:* @{{ $json.author }}\n*High-Risk Files:* {{ $json.risk_count }}\n{{ $json.risky_files.slice(0,5).map(f=>'\u2022 `'+f+'`').join('\\n') }}\n\n_Security checklist posted. @appsec-team assigned._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "PR Files Changed": {
+      "main": [
+        [
+          {
+            "node": "Classify File Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify File Risk": {
+      "main": [
+        [
+          {
+            "node": "High-Risk Files?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High-Risk Files?": {
+      "main": [
+        [
+          {
+            "node": "Request AppSec Reviewer",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Post Security Checklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Request AppSec Reviewer": {
+      "main": [
+        [
+          {
+            "node": "AppSec Review Assigned",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Security Checklist": {
+      "main": [
+        [
+          {
+            "node": "AppSec Review Assigned",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "devsecops",
+    "workflow_id": "DS-04",
+    "phase": 2,
+    "description": "On PR with high-risk file changes \u2192 auto-assign AppSec reviewer + add security checklist comment."
+  }
+}

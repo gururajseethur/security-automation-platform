@@ -1,0 +1,420 @@
+# Cyber Constellation — Threat Hunting Query Library
+# Used by BT-06 Threat Hunt Automation as baseline hypotheses
+# Format: Wazuh (rule.id / data.win / syscheck) + Splunk SPL equivalents
+# MITRE ATT&CK mapped per query
+# ═══════════════════════════════════════════════════════════════════════════════
+
+queries:
+
+  # ── CREDENTIAL ACCESS ───────────────────────────────────────────────────────
+
+  - id: TH-CRED-001
+    name: "LSASS Memory Access (Credential Dumping)"
+    hypothesis: "Adversary is dumping credentials from LSASS using Mimikatz or similar tool"
+    mitre: "T1003.001"
+    tactic: "Credential Access"
+    priority: "Critical"
+    wazuh: |
+      SELECT data.win.eventdata.targetImage, data.win.eventdata.sourceImage,
+             data.win.eventdata.grantedAccess, agent.name, timestamp
+      FROM fim_events
+      WHERE data.win.eventdata.targetImage LIKE '%lsass.exe%'
+        AND data.win.eventdata.grantedAccess IN ('0x1010','0x1038','0x40','0x1fffff')
+        AND timestamp >= NOW() - INTERVAL '24 hours'
+      ORDER BY timestamp DESC
+      LIMIT 50;
+    splunk: |
+      index=windows EventCode=10 TargetImage="*lsass.exe*"
+      (GrantedAccess="0x1010" OR GrantedAccess="0x1038" OR GrantedAccess="0x1fffff")
+      | table _time, Computer, SourceImage, TargetImage, GrantedAccess
+      | sort -_time
+    sigma: |
+      title: LSASS Memory Access
+      detection:
+        selection:
+          EventID: 10
+          TargetImage|endswith: '\lsass.exe'
+          GrantedAccess:
+            - '0x1010'
+            - '0x1038'
+            - '0x40'
+            - '0x1fffff'
+        condition: selection
+    investigation_steps:
+      - "Identify the SourceImage — is it a known legitimate process?"
+      - "Check if Sysmon event 1 (ProcessCreate) shows how SourceImage was spawned"
+      - "Look for base64-encoded PowerShell or cmd.exe launching shortly before"
+      - "Check for Mimikatz strings: sekurlsa, privilege::debug, lsadump"
+
+  - id: TH-CRED-002
+    name: "Pass-the-Hash / Lateral Movement via SMB"
+    hypothesis: "Adversary is moving laterally using stolen NTLM hashes"
+    mitre: "T1550.002"
+    tactic: "Lateral Movement"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.win.system.eventID,
+             data.win.eventdata.subjectUserName,
+             data.win.eventdata.targetUserName,
+             data.win.eventdata.ipAddress,
+             data.win.eventdata.logonType,
+             timestamp
+      FROM bt_alert_log
+      WHERE rule_id IN ('60106','60107','18107','18108')
+        AND data.win.eventdata.logonType = '3'
+        AND data.win.eventdata.authenticationPackageName = 'NTLM'
+        AND timestamp >= NOW() - INTERVAL '4 hours'
+      ORDER BY timestamp DESC;
+    splunk: |
+      index=windows EventCode=4624 Logon_Type=3 Authentication_Package=NTLM
+      | stats count by src_ip, dest, user, _time
+      | where count > 3
+      | sort -count
+    investigation_steps:
+      - "Identify source IP — is it a workstation or server?"
+      - "Check if source account is an admin account or service account"
+      - "Look for EventID 4648 (explicit credentials) on the source"
+      - "Correlate with EventID 4688/1 for new process creation on target"
+
+  - id: TH-CRED-003
+    name: "Kerberoasting — SPN Enumeration"
+    hypothesis: "Adversary is requesting Kerberos TGS tickets for service accounts to crack offline"
+    mitre: "T1558.003"
+    tactic: "Credential Access"
+    priority: "High"
+    wazuh: |
+      SELECT data.win.eventdata.targetUserName,
+             data.win.eventdata.clientAddress,
+             data.win.eventdata.serviceName,
+             COUNT(*) as ticket_requests,
+             MIN(timestamp) as first_seen,
+             MAX(timestamp) as last_seen
+      FROM bt_alert_log
+      WHERE data.win.system.eventID = '4769'
+        AND data.win.eventdata.ticketEncryptionType = '0x17'
+        AND data.win.eventdata.targetUserName NOT LIKE '%$'
+        AND timestamp >= NOW() - INTERVAL '1 hour'
+      GROUP BY data.win.eventdata.targetUserName, data.win.eventdata.clientAddress,
+               data.win.eventdata.serviceName
+      HAVING COUNT(*) > 1
+      ORDER BY ticket_requests DESC;
+    splunk: |
+      index=windows EventCode=4769 Ticket_Encryption_Type=0x17
+      NOT (Account_Name="*$")
+      | stats count by Account_Name, Client_Address, Service_Name
+      | where count > 2
+      | sort -count
+    investigation_steps:
+      - "Multiple RC4 TGS requests in short window from same IP = Kerberoasting tool"
+      - "Identify which accounts had TGS requested — are any high-value service accounts?"
+      - "Force password rotation on all enumerated SPNs immediately"
+      - "Consider Kerberos AES-only policy for sensitive service accounts"
+
+  # ── PERSISTENCE ─────────────────────────────────────────────────────────────
+
+  - id: TH-PERS-001
+    name: "Scheduled Task / Cron Persistence"
+    hypothesis: "Adversary created a scheduled task or cron job for persistence"
+    mitre: "T1053"
+    tactic: "Persistence"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.taskName,
+             data.win.eventdata.taskContent,
+             data.win.eventdata.subjectUserName,
+             timestamp
+      FROM bt_alert_log
+      WHERE rule_id = '60009'
+        AND data.win.system.eventID IN ('4698','4702')
+        AND data.win.eventdata.subjectUserName NOT IN ('SYSTEM','LOCAL SERVICE','NETWORK SERVICE')
+        AND timestamp >= NOW() - INTERVAL '24 hours'
+      ORDER BY timestamp DESC;
+    linux_wazuh: |
+      SELECT agent.name, syscheck.path, syscheck.event, timestamp
+      FROM syscheck_events
+      WHERE syscheck.path LIKE '/etc/cron%'
+        OR syscheck.path LIKE '/var/spool/cron%'
+        OR syscheck.path LIKE '/etc/systemd/system%'
+      AND syscheck.event IN ('added','modified')
+      AND timestamp >= NOW() - INTERVAL '24 hours'
+      ORDER BY timestamp DESC;
+    splunk: |
+      (index=windows EventCode=4698) OR
+      (index=linux source="/var/log/cron" "CRON[*]")
+      | eval suspicious=if(match(command,"base64|wget|curl|/tmp/|python|powershell"),1,0)
+      | where suspicious=1
+      | table _time, host, user, command
+    investigation_steps:
+      - "Review task content — does it reference unusual paths, base64, or network calls?"
+      - "Check if task was created by a non-admin account (lateral movement indicator)"
+      - "Look for corresponding process execution shortly after task creation"
+      - "Compare against baseline scheduled tasks from 30 days ago"
+
+  - id: TH-PERS-002
+    name: "New Local Admin Account Created"
+    hypothesis: "Adversary created a local admin account for persistence or backdoor access"
+    mitre: "T1136.001"
+    tactic: "Persistence"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.targetUserName,
+             data.win.eventdata.subjectUserName,
+             data.win.eventdata.subjectDomainName,
+             timestamp
+      FROM bt_alert_log
+      WHERE rule_id IN ('60002','18105')
+        AND data.win.system.eventID IN ('4720','4732')
+        AND timestamp >= NOW() - INTERVAL '24 hours'
+      ORDER BY timestamp DESC;
+    splunk: |
+      index=windows (EventCode=4720 OR EventCode=4732)
+      | eval member_group=if(EventCode==4732,Group_Name,null())
+      | search member_group="Administrators" OR EventCode=4720
+      | table _time, Computer, Account_Name, Subject_Account_Name, member_group
+      | sort -_time
+    investigation_steps:
+      - "Who created the account? Is it a known admin process or unusual?"
+      - "Was the account immediately added to Administrators group (EventID 4732)?"
+      - "Check if account name follows normal naming conventions"
+      - "Disable account immediately if creation cannot be explained"
+
+  # ── DISCOVERY ───────────────────────────────────────────────────────────────
+
+  - id: TH-DISC-001
+    name: "Active Directory Enumeration (BloodHound)"
+    hypothesis: "Adversary is running AD enumeration tools to map attack paths"
+    mitre: "T1069.002"
+    tactic: "Discovery"
+    priority: "Medium"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.subjectUserName,
+             COUNT(*) as ldap_queries,
+             MIN(timestamp) as first_query,
+             MAX(timestamp) as last_query
+      FROM bt_alert_log
+      WHERE rule_id = '60204'
+        AND data.win.system.eventID = '4662'
+        AND data.win.eventdata.objectType LIKE '%group%'
+        AND timestamp >= NOW() - INTERVAL '30 minutes'
+      GROUP BY agent.name, data.win.eventdata.subjectUserName
+      HAVING COUNT(*) > 100
+      ORDER BY ldap_queries DESC;
+    splunk: |
+      index=windows EventCode=4662
+      | bucket _time span=5m
+      | stats count by _time, Account_Name, Computer
+      | where count > 100
+      | sort -_time
+    investigation_steps:
+      - "100+ LDAP queries in 5 minutes from a non-AD-admin account = BloodHound/SharpHound"
+      - "Check process that made the LDAP calls via Sysmon Event 3 (NetworkConnect)"
+      - "Look for PowerShell/C# execution shortly before the queries started"
+      - "Run BloodHound defensively to understand what attack paths were exposed"
+
+  - id: TH-DISC-002
+    name: "Port Scanning from Internal Host"
+    hypothesis: "Compromised internal host is scanning the network for lateral movement targets"
+    mitre: "T1046"
+    tactic: "Discovery"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.srcip,
+             COUNT(DISTINCT data.dstport) as unique_ports,
+             COUNT(DISTINCT data.dstip) as unique_targets,
+             MIN(timestamp) as first_seen
+      FROM bt_alert_log
+      WHERE rule_id IN ('1002','5710','40101')
+        AND timestamp >= NOW() - INTERVAL '15 minutes'
+      GROUP BY agent.name, data.srcip
+      HAVING COUNT(DISTINCT data.dstport) > 20
+        OR COUNT(DISTINCT data.dstip) > 15
+      ORDER BY unique_ports DESC;
+    splunk: |
+      index=firewall action=block
+      | bucket _time span=5m
+      | stats dc(dest_port) as port_count, dc(dest) as target_count by _time, src
+      | where port_count > 20 OR target_count > 15
+      | sort -port_count
+    investigation_steps:
+      - "Identify source host — check for running processes with network capability"
+      - "Look for Nmap, masscan, or living-off-the-land tools (netstat, arp, ping sweep)"
+      - "Check if scan pattern is horizontal (many IPs) = recon, or vertical (many ports) = targeting"
+      - "Consider network isolation of source host while investigating"
+
+  # ── EXFILTRATION ────────────────────────────────────────────────────────────
+
+  - id: TH-EXFIL-001
+    name: "Unusual Outbound Data Volume"
+    hypothesis: "Adversary is exfiltrating data via large outbound transfers"
+    mitre: "T1041"
+    tactic: "Exfiltration"
+    priority: "Critical"
+    wazuh: |
+      SELECT agent.name, data.srcip, data.dstip, data.dstport,
+             SUM(CAST(data.bytes_sent AS BIGINT)) as total_bytes,
+             COUNT(*) as connection_count,
+             MIN(timestamp) as first_seen
+      FROM bt_alert_log
+      WHERE timestamp >= NOW() - INTERVAL '1 hour'
+        AND data.bytes_sent IS NOT NULL
+      GROUP BY agent.name, data.srcip, data.dstip, data.dstport
+      HAVING SUM(CAST(data.bytes_sent AS BIGINT)) > 104857600  -- 100MB
+      ORDER BY total_bytes DESC;
+    splunk: |
+      index=firewall
+      | stats sum(bytes_out) as total_out by src_ip, dest_ip, dest_port
+      | where total_out > 104857600
+      | eval total_out_mb=round(total_out/1024/1024,1)
+      | sort -total_out_mb
+    investigation_steps:
+      - "Is destination IP internal or external? External = immediate investigation"
+      - "Which process is making the connections? Check Sysmon Event 3"
+      - "Is the destination a known cloud storage (S3, Mega, Dropbox, pastebin)?"
+      - "Compare against baseline transfer volumes for this host"
+
+  - id: TH-EXFIL-002
+    name: "DNS Tunneling Data Exfiltration"
+    hypothesis: "Adversary is using DNS queries to exfiltrate data out of the network"
+    mitre: "T1048.003"
+    tactic: "Exfiltration"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.queryName,
+             data.win.eventdata.queryResults,
+             COUNT(*) as query_count,
+             AVG(LENGTH(data.win.eventdata.queryName)) as avg_query_length
+      FROM bt_alert_log
+      WHERE rule_id = '82200'
+        AND timestamp >= NOW() - INTERVAL '1 hour'
+      GROUP BY agent.name, data.win.eventdata.queryName, data.win.eventdata.queryResults
+      HAVING AVG(LENGTH(data.win.eventdata.queryName)) > 50
+        OR COUNT(*) > 100
+      ORDER BY query_count DESC;
+    splunk: |
+      index=dns
+      | eval domain_len=len(query)
+      | stats count, avg(domain_len) as avg_len by src_ip, query
+      | where avg_len > 50 OR count > 100
+      | sort -avg_len
+    investigation_steps:
+      - "High entropy domain names + unusual TXT/NULL query types = DNS tunneling"
+      - "Check parent domain — is it known legitimate or freshly registered?"
+      - "Identify process making DNS calls (Sysmon Event 22)"
+      - "Block domain at DNS resolver level, investigate source host thoroughly"
+
+  # ── COMMAND & CONTROL ────────────────────────────────────────────────────────
+
+  - id: TH-C2-001
+    name: "Beaconing Detection — Regular Outbound Intervals"
+    hypothesis: "Compromised host is beaconing to C2 infrastructure at regular intervals"
+    mitre: "T1071"
+    tactic: "Command and Control"
+    priority: "High"
+    wazuh: |
+      SELECT data.srcip, data.dstip, data.dstport,
+             COUNT(*) as connection_count,
+             STDDEV(EXTRACT(EPOCH FROM timestamp)) as time_stddev,
+             AVG(CAST(data.bytes_sent AS BIGINT)) as avg_bytes
+      FROM bt_alert_log
+      WHERE timestamp >= NOW() - INTERVAL '4 hours'
+        AND data.dstip NOT IN (SELECT ip FROM known_good_ips)
+      GROUP BY data.srcip, data.dstip, data.dstport
+      HAVING COUNT(*) > 10
+        AND STDDEV(EXTRACT(EPOCH FROM timestamp)) < 30  -- Very regular = beaconing
+      ORDER BY time_stddev ASC;
+    splunk: |
+      index=firewall
+      | bucket _time span=5m
+      | stats count by src_ip, dest_ip, dest_port, _time
+      | streamstats window=12 stdev(count) as stddev by src_ip, dest_ip
+      | where stddev < 2 AND count > 5
+      | sort stddev
+    investigation_steps:
+      - "Regular intervals (low stddev) + unknown external IP = C2 beacon pattern"
+      - "What process is making the connection? Sysmon Event 3 → parent process"
+      - "Perform passive DNS analysis on destination — registration date, ASN"
+      - "Submit destination IP/domain to VirusTotal, URLScan, Threat Intelligence"
+
+  # ── PRIVILEGE ESCALATION ────────────────────────────────────────────────────
+
+  - id: TH-PRIVESC-001
+    name: "Token Impersonation / Local Privilege Escalation"
+    hypothesis: "Adversary is escalating privileges by impersonating tokens or exploiting local vulns"
+    mitre: "T1134"
+    tactic: "Privilege Escalation"
+    priority: "High"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.subjectUserName,
+             data.win.eventdata.targetUserName,
+             data.win.eventdata.privileges,
+             timestamp
+      FROM bt_alert_log
+      WHERE rule_id IN ('60106','4672']
+        AND data.win.system.eventID = '4672'
+        AND data.win.eventdata.subjectUserName NOT LIKE '%$'
+        AND data.win.eventdata.privileges LIKE '%SeDebugPrivilege%'
+        AND timestamp >= NOW() - INTERVAL '4 hours'
+      ORDER BY timestamp DESC;
+    splunk: |
+      index=windows EventCode=4672
+      NOT (Account_Name="*$" OR Account_Name=SYSTEM)
+      Special_Privileges=*SeDebugPrivilege*
+      | table _time, Computer, Account_Name, Special_Privileges
+      | sort -_time
+    investigation_steps:
+      - "SeDebugPrivilege granted to non-admin user = privilege escalation occurred"
+      - "Trace back to which process triggered the logon event"
+      - "Check for parent processes: PrintSpoofer, JuicyPotato, RoguePotato patterns"
+      - "Look for subsequent admin-level process creation from the elevated session"
+
+  # ── LATERAL MOVEMENT ────────────────────────────────────────────────────────
+
+  - id: TH-LAT-001
+    name: "Remote Service Execution (PsExec / WMI / WinRM)"
+    hypothesis: "Adversary is using remote execution techniques for lateral movement"
+    mitre: "T1021"
+    tactic: "Lateral Movement"
+    priority: "Critical"
+    wazuh: |
+      SELECT agent.name, data.win.eventdata.serviceName,
+             data.win.eventdata.clientProcessId,
+             data.srcip,
+             timestamp
+      FROM bt_alert_log
+      WHERE rule_id IN ('18105','60106']
+        AND (
+          data.win.eventdata.serviceName LIKE '%psexesvc%'
+          OR data.win.eventdata.serviceName LIKE '%remcom%'
+          OR data.win.system.channel = 'Microsoft-Windows-WinRM/Operational'
+        )
+        AND timestamp >= NOW() - INTERVAL '1 hour'
+      ORDER BY timestamp DESC;
+    splunk: |
+      index=windows
+      ((EventCode=7045 ServiceName IN ("PSEXESVC","remcom*","PAExec*"))
+      OR (EventCode=4688 Process_Name IN ("*wmiprvse.exe","*wsmprovhost.exe"))
+        AND Parent_Process IN ("*svchost.exe")))
+      | table _time, Computer, ServiceName, Process_Name, Account_Name
+      | sort -_time
+    investigation_steps:
+      - "PsExec: look for ADMIN$ share access + PSEXESVC service creation in sequence"
+      - "WMI: wmiprvse.exe spawning cmd.exe / powershell.exe is unusual"
+      - "WinRM: wsmprovhost.exe parent of shell = remote PowerShell session"
+      - "Identify source IP and map to compromised host already in scope"
+
+# ── METADATA ────────────────────────────────────────────────────────────────
+metadata:
+  total_queries: 12
+  mitre_tactics_covered:
+    - "Credential Access"
+    - "Persistence"
+    - "Discovery"
+    - "Lateral Movement"
+    - "Command and Control"
+    - "Exfiltration"
+    - "Privilege Escalation"
+  platforms: ["Windows", "Linux"]
+  data_sources: ["Wazuh", "Splunk", "PostgreSQL (Constellation DB)"]
+  maintained_by: "Hexamind — Gururaj Seethur"
+  version: "1.0"
+  last_updated: "2026-04"

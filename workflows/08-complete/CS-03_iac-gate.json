@@ -1,0 +1,174 @@
+{
+  "name": "\u2601\ufe0f CS-03 | Infrastructure-as-Code Security Gate (Checkov)",
+  "nodes": [
+    {
+      "id": "cs3-wh",
+      "name": "Terraform PR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cloud/iac-commit",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "cs3-extract",
+      "name": "Extract IaC Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst pr=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{pr_number:pr.number||pr.pull_request?.number,repo:pr.repository?.full_name||pr.repo,\n  branch:pr.pull_request?.head?.ref||pr.branch,commit_sha:pr.pull_request?.head?.sha||pr.after,\n  author:pr.pull_request?.user?.login||'ci',scan_id:`CHECKOV-${Date.now()}`}}];"
+      }
+    },
+    {
+      "id": "cs3-checkov",
+      "name": "Run Checkov Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// Production: exec checkov -d /path/to/terraform --output json --soft-fail\n// Mock Checkov JSON output structure:\nconst ctx=$input.first().json;\nconst mock=[\n  {check_id:'CKV_AWS_58',check_type:'terraform',resource:'aws_s3_bucket.data',check_result:{result:'FAILED'},severity:'HIGH',\n   short_description:'Ensure S3 bucket encryption is enabled',guideline:'https://docs.prismacloud.io/en/enterprise-edition/policy-reference/aws-policies/aws-s3-policies/s3-14-data-encrypted-at-rest'},\n  {check_id:'CKV_AWS_18',check_type:'terraform',resource:'aws_s3_bucket.logs',check_result:{result:'PASSED'},severity:'MEDIUM',short_description:'Ensure access logging enabled'}\n];\nconst failed=mock.filter(c=>c.check_result.result==='FAILED');\nconst critical=failed.filter(c=>c.severity==='CRITICAL');\nconst high=failed.filter(c=>c.severity==='HIGH');\nreturn[{json:{...ctx,checks_run:mock.length,failed_count:failed.length,critical_count:critical.length,\n  high_count:high.length,should_fail:critical.length>0||high.length>0,\n  failed_checks:failed,scanned_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "cs3-status",
+      "name": "Set GitHub Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/statuses/{{ $json.commit_sha }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"state\":\"{{ $json.should_fail?'failure':'success' }}\",\"description\":\"{{ $json.should_fail?$json.failed_count+' IaC security issues found':'No IaC security issues' }}\",\"context\":\"constellation/iac-security\",\"target_url\":\"https://checkov.io\"}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_API",
+          "name": "GitHub API"
+        }
+      }
+    },
+    {
+      "id": "cs3-slack",
+      "name": "IaC Scan Result",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "=\u2601\ufe0f *IaC Security Scan \u2014 PR #{{ $json.pr_number }}*\n\n*Repo:* {{ $json.repo }}\n*Author:* @{{ $json.author }}\n*Failed Checks:* {{ $json.failed_count }} ({{ $json.critical_count }} Critical, {{ $json.high_count }} High)\n*Status:* {{ $json.should_fail?'\ud83d\udd34 FAILED \u2014 merge blocked':'\u2705 Passed' }}\n\n{{ $json.failed_checks.slice(0,3).map(c=>'\u2022 ['+c.severity+'] '+c.check_id+': '+c.short_description+' on '+c.resource).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Terraform PR Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract IaC Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract IaC Context": {
+      "main": [
+        [
+          {
+            "node": "Run Checkov Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Checkov Analysis": {
+      "main": [
+        [
+          {
+            "node": "Set GitHub Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set GitHub Status": {
+      "main": [
+        [
+          {
+            "node": "IaC Scan Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "cloud",
+    "workflow_id": "CS-03",
+    "phase": 2,
+    "description": "On Terraform PR: run Checkov \u2192 fail GitHub status check on HIGH/CRITICAL findings \u2192 post inline comments."
+  }
+}

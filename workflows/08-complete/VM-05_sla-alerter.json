@@ -1,0 +1,238 @@
+{
+  "name": "\ud83d\udd2c VM-05 | Vulnerability Aging & SLA Breach Alerter",
+  "nodes": [
+    {
+      "id": "v5-cron",
+      "name": "Daily 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "v5-breached",
+      "name": "Fetch NEW SLA Breaches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT v.cve_id, v.cvss_v3, v.epss_score, v.composite_score, v.priority_tier,\n       v.days_open, v.asset_id, v.assigned_to, a.owner_team, a.owner_email\nFROM vulnerabilities v\nLEFT JOIN cmdb_assets a ON v.asset_id=a.asset_id\nWHERE v.sla_breached=true\n  AND v.status='open'\n  AND v.cve_id NOT IN (\n    SELECT cve_id FROM sla_breach_alerts\n    WHERE alerted_at >= NOW() - INTERVAL '24 hours'\n  )\nORDER BY v.composite_score DESC\nLIMIT 50;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "v5-classify",
+      "name": "Classify Breach Severity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst items=$input.all().map(i=>i.json);\nconst p1=items.filter(v=>v.priority_tier==='P1-Critical');\nconst p2=items.filter(v=>v.priority_tier==='P2-High');\nconst needs_ciso=p1.length>0;\nreturn[{json:{total_breaches:items.length,p1_count:p1.length,p2_count:p2.length,\n  needs_ciso_escalation:needs_ciso,items,p1_items:p1,\n  escalation_message:needs_ciso?`${p1.length} P1-Critical vulnerabilities are past SLA. CISO action required.`:null,\n  alerted_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "v5-log",
+      "name": "Log Alerts Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sla_breach_alerts (cve_id,alerted_at,priority_tier) SELECT unnest($1::text[]),NOW(),$2 FROM (SELECT 1) t ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "v5-slack",
+      "name": "SLA Breach Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_VULN_MGMT"
+        },
+        "text": "=\ud83d\udd2c *NEW SLA Breaches \u2014 {{ $json.total_breaches }} vulns overdue*\n\n*P1 Critical (1d SLA):* {{ $json.p1_count }}\n*P2 High (7d SLA):* {{ $json.p2_count }}\n\n{{ $json.p1_items.slice(0,5).map(v=>'\ud83d\udd34 '+v.cve_id+' on '+v.asset_id+' \u2014 Day '+v.days_open+' | Score: '+v.composite_score).join('\\n') }}\n\n{{ $json.needs_ciso_escalation?'\u2b06\ufe0f CISO escalation triggered.':'' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "v5-ciso-gate",
+      "name": "Needs CISO?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-v5-ciso-gate",
+              "leftValue": "={{ $json.needs_ciso_escalation }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "v5-ciso",
+      "name": "Escalate to CISO",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CISO"
+        },
+        "text": "=\ud83d\udd2c *CISO ESCALATION \u2014 Critical Vuln SLA Breach*\n\n{{ $json.escalation_message }}\n\n{{ $json.p1_items.slice(0,5).map(v=>'\ud83d\udd34 '+v.cve_id+' ('+v.asset_id+') \u2014 '+v.days_open+'d open, CVSS '+v.cvss_v3).join('\\n') }}\n\n_Immediate action or documented risk acceptance required._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 09:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch NEW SLA Breaches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch NEW SLA Breaches": {
+      "main": [
+        [
+          {
+            "node": "Classify Breach Severity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Breach Severity": {
+      "main": [
+        [
+          {
+            "node": "Log Alerts Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Alerts Sent": {
+      "main": [
+        [
+          {
+            "node": "SLA Breach Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SLA Breach Alert": {
+      "main": [
+        [
+          {
+            "node": "Needs CISO?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs CISO?": {
+      "main": [
+        [
+          {
+            "node": "Escalate to CISO",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "vuln-mgmt",
+    "workflow_id": "VM-05",
+    "phase": 1,
+    "description": "Daily: finds newly breached SLA vulns (not already alerted). Escalates to CISO for P1 breaches. Separate from VM-03v2 diff scorer."
+  }
+}

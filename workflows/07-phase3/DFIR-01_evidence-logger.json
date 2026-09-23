@@ -1,0 +1,233 @@
+{
+  "name": "\ud83d\udd0d DFIR-01 | Forensic Evidence Auto-Logger",
+  "nodes": [
+    {
+      "id": "d1-wh",
+      "name": "Incident Declared",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dfir/evidence-collect",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "d1-init",
+      "name": "Initialize Case",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst caseId=`DFIR-${Date.now()}`;\nconst hosts=Array.isArray(evt.affected_hosts)?evt.affected_hosts:[evt.hostname||evt.host||'unknown'];\nreturn[{json:{case_id:caseId,incident_id:evt.incident_id||caseId,hosts,severity:evt.severity||'High',\n  declared_by:evt.declared_by||'system',declared_at:new Date().toISOString(),\n  evidence_bucket:`s3://constellation-evidence/${caseId}/`,\n  legal_hold:evt.legal_hold||false}}];"
+      }
+    },
+    {
+      "id": "d1-create",
+      "name": "Create Evidence Case",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dfir_cases (case_id,incident_id,hosts_json,severity,declared_by,declared_at,evidence_location,status) VALUES ('CID','IID','[]','High','sys',NOW(),'s3://bucket','Active') ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d1-collect",
+      "name": "Plan Evidence Collection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst c=$input.first().json;\n// Define collection tasks per host\nconst tasks=c.hosts.flatMap(host=>[\n  {host,task:'collect_system_logs',files:['/var/log/syslog','/var/log/auth.log','/var/log/messages'],priority:1},\n  {host,task:'collect_process_list',command:'ps auxf',priority:1},\n  {host,task:'collect_network_state',command:'netstat -antp',priority:1},\n  {host,task:'collect_open_files',command:'lsof -n',priority:2},\n  {host,task:'collect_cron_jobs',files:['/etc/cron*','/var/spool/cron'],priority:2},\n  {host,task:'collect_bash_history',files:['/root/.bash_history','~/.bash_history'],priority:1}\n]);\n// Calculate evidence hash (in production: SHA-256 each file, store manifest)\nconst evidence_manifest={case_id:c.case_id,collection_time:new Date().toISOString(),\n  tasks_planned:tasks.length,hosts:c.hosts,collector:'Constellation DFIR-01'};\nreturn[{json:{...c,tasks,tasks_count:tasks.length,evidence_manifest}}];"
+      }
+    },
+    {
+      "id": "d1-log",
+      "name": "Log Evidence Manifest",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dfir_evidence_log (case_id,task_type,host,status,collected_at) VALUES ('CID','logs','host','Planned',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d1-jira",
+      "name": "Create DFIR Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "DFIR",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[DFIR-{{ $json.severity.toUpperCase() }}] {{ $json.case_id }} | {{ $json.hosts.join(', ') }} | {{ $json.tasks_count }} collection tasks",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.severity==='Critical'?'Highest':'High' }}"
+          },
+          "labels": [
+            "dfir",
+            "forensics",
+            "evidence"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "d1-slack",
+      "name": "DFIR Case Opened",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_DFIR"
+        },
+        "text": "=\ud83d\udd0d *DFIR Case Opened*\n\n*Case ID:* `{{ $json.case_id }}`\n*Hosts:* {{ $json.hosts.join(', ') }}\n*Evidence Location:* `{{ $json.evidence_bucket }}`\n*Tasks Planned:* {{ $json.tasks_count }}\n*Legal Hold:* {{ $json.legal_hold?'\u2705 Yes':'\u274c No' }}\n*Jira:* {{ $('Create DFIR Jira').first().json.key }}\n\n_Chain of custody initiated. Do not touch affected systems without logging._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Incident Declared": {
+      "main": [
+        [
+          {
+            "node": "Initialize Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Case": {
+      "main": [
+        [
+          {
+            "node": "Create Evidence Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Evidence Case": {
+      "main": [
+        [
+          {
+            "node": "Plan Evidence Collection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Evidence Collection": {
+      "main": [
+        [
+          {
+            "node": "Log Evidence Manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Evidence Manifest": {
+      "main": [
+        [
+          {
+            "node": "Create DFIR Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create DFIR Jira": {
+      "main": [
+        [
+          {
+            "node": "DFIR Case Opened",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "dfir",
+    "workflow_id": "DFIR-01",
+    "phase": 3,
+    "description": "On incident declaration: auto-collect system logs, hash files, store to S3 with chain of custody. Creates legal hold."
+  }
+}

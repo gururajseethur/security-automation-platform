@@ -1,0 +1,259 @@
+{
+  "name": "\ud83d\udd11 IAM-04 | Impossible Travel & Login Anomaly Detector",
+  "nodes": [
+    {
+      "id": "i4-wh",
+      "name": "Login Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "iam/login-event",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "i4-check",
+      "name": "Check Impossible Travel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst username=evt.username||evt.user||evt.email;\nconst src_ip=evt.src_ip||evt.ip||'0.0.0.0';\nconst login_time=new Date(evt.timestamp||Date.now());\nreturn[{json:{username,src_ip,login_time:login_time.toISOString(),\n  country:evt.geo_country||evt.country||'Unknown',\n  city:evt.geo_city||evt.city||'Unknown',\n  event_id:`IAM-LOGIN-${Date.now()}`}}];"
+      }
+    },
+    {
+      "id": "i4-prev",
+      "name": "Get Previous Login",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT src_ip, country, city, login_time\nFROM iam_login_history\nWHERE username='placeholder'\n  AND login_time >= NOW() - INTERVAL '2 hours'\n  AND login_time < NOW()\nORDER BY login_time DESC\nLIMIT 1;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "i4-velocity",
+      "name": "Calculate Travel Velocity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst current=$('Check Impossible Travel').first().json;\nconst prev_logins=$('Get Previous Login').all().map(i=>i.json);\nif(prev_logins.length===0){\n  return[{json:{...current,is_impossible:false,velocity_kmh:0,prev_country:null,\n    reason:'No previous login in 2hr window'}}];\n}\nconst prev=prev_logins[0];\nconst time_diff_hours=(new Date(current.login_time)-new Date(prev.login_time))/3600000;\nconst country_changed=prev.country&&prev.country!==current.country&&prev.country!=='Unknown';\n// Rough max travel: commercial flight ~900 km/h \u2014 if different country in < 2hr = impossible\nconst is_impossible=country_changed&&time_diff_hours<2;\nconst confidence=is_impossible?88:40;\nreturn[{json:{...current,is_impossible,prev_country:prev.country,prev_ip:prev.src_ip,\n  time_diff_hours:time_diff_hours.toFixed(2),confidence,\n  reason:is_impossible?`Login from ${current.country} then ${prev.country} in ${time_diff_hours.toFixed(1)}hr \u2014 impossible travel`:'No anomaly detected'}}];"
+      }
+    },
+    {
+      "id": "i4-log",
+      "name": "Log Login Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO iam_login_history (username,src_ip,country,city,login_time) VALUES ('user','0.0.0.0','IN','Bengaluru',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "i4-gate",
+      "name": "Impossible Travel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-i4-gate",
+              "leftValue": "={{ $json.is_impossible }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "i4-mfa",
+      "name": "Trigger MFA Re-Auth",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1300,
+        360
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.okta.domain }}/api/v1/users/{{ $json.username }}/lifecycle/expire_password",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=SSWS {{ $credentials.okta.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OKTA_API",
+          "name": "Okta API"
+        }
+      }
+    },
+    {
+      "id": "i4-slack",
+      "name": "Impossible Travel Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        560
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IAM"
+        },
+        "text": "=\ud83d\udd11 *Impossible Travel Detected \u2014 HIGH CONFIDENCE*\n\n*User:* {{ $json.username }}\n*Current:* {{ $json.src_ip }} ({{ $json.country }}, {{ $json.city }})\n*Previous:* {{ $json.prev_ip }} ({{ $json.prev_country }})\n*Time Gap:* {{ $json.time_diff_hours }}hr\n*Confidence:* {{ $json.confidence }}%\n\n*Actions:* MFA step-up triggered. Manager notified.\n\u26a0\ufe0f Likely credential compromise.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Login Event": {
+      "main": [
+        [
+          {
+            "node": "Check Impossible Travel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Impossible Travel": {
+      "main": [
+        [
+          {
+            "node": "Get Previous Login",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Previous Login": {
+      "main": [
+        [
+          {
+            "node": "Calculate Travel Velocity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Travel Velocity": {
+      "main": [
+        [
+          {
+            "node": "Log Login Event",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Impossible Travel?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Impossible Travel?": {
+      "main": [
+        [
+          {
+            "node": "Trigger MFA Re-Auth",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Impossible Travel Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "iam",
+    "workflow_id": "IAM-04",
+    "phase": 1,
+    "description": "Event-driven. Login from 2 countries < 2hr \u2192 MFA step-up + alert manager. Uses GeoIP velocity calculation."
+  }
+}

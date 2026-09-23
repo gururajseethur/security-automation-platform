@@ -1,0 +1,187 @@
+{
+  "name": "\u2601\ufe0f CS-04 | CSPM Finding Manager (Wiz/Prisma)",
+  "nodes": [
+    {
+      "id": "cs4-cron",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "cs4-wiz",
+      "name": "Fetch Wiz Findings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.app.wiz.io/graphql",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"query\":\"{ issues(first:100 filterBy:{status:[OPEN] severity:[CRITICAL HIGH]}) { nodes { id title severity resource { name type } createdAt } } }\"}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.wizApi.token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WIZ_API",
+          "name": "Wiz API"
+        }
+      }
+    },
+    {
+      "id": "cs4-score",
+      "name": "Score & Assign Findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst raw=$input.first().json?.data?.issues?.nodes||[];\nconst scored=raw.map(f=>{\n  const age=Math.floor((Date.now()-new Date(f.createdAt))/86400000);\n  const sla=f.severity==='CRITICAL'?3:f.severity==='HIGH'?7:30;\n  return{finding_id:f.id,title:f.title,severity:f.severity,resource:f.resource?.name,\n    resource_type:f.resource?.type,age_days:age,sla_days:sla,\n    sla_breached:age>sla,created_at:f.createdAt};\n});\nscored.sort((a,b)=>b.sla_breached-a.sla_breached||b.age_days-a.age_days);\nconst breached=scored.filter(s=>s.sla_breached);\nreturn[{json:{total:scored.length,sla_breached:breached.length,critical:scored.filter(s=>s.severity==='CRITICAL').length,\n  findings:scored,breached_findings:breached,scanned_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "cs4-upsert",
+      "name": "Upsert to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO cloud_posture_findings (finding_id,title,severity,resource,sla_days,age_days,sla_breached,created_at)\nVALUES ('FID','title','HIGH','resource',7,0,false,NOW())\nON CONFLICT (finding_id) DO UPDATE SET age_days=EXCLUDED.age_days, sla_breached=EXCLUDED.sla_breached;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "cs4-slack",
+      "name": "CSPM Daily Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "=\u2601\ufe0f *Daily Cloud Posture Report*\n\n*Open Findings:* {{ $json.total }}\n*Critical:* {{ $json.critical }}\n*SLA Breaches:* {{ $json.sla_breached }}\n\n{{ $json.breached_findings.slice(0,5).map(f=>'\u23f0 ['+f.severity+'] '+f.title+' \u2014 '+f.resource+' ('+f.age_days+'d old, SLA '+f.sla_days+'d)').join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Wiz Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Wiz Findings": {
+      "main": [
+        [
+          {
+            "node": "Score & Assign Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & Assign Findings": {
+      "main": [
+        [
+          {
+            "node": "Upsert to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to DB": {
+      "main": [
+        [
+          {
+            "node": "CSPM Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "cloud",
+    "workflow_id": "CS-04",
+    "phase": 2,
+    "description": "Daily: pulls cloud security posture findings. Dedupes, scores, assigns to asset owners with SLA. Tracks aging."
+  }
+}

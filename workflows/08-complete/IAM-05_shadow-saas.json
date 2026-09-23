@@ -1,0 +1,253 @@
+{
+  "name": "\ud83d\udd11 IAM-05 | Shadow SaaS Account Hunter",
+  "nodes": [
+    {
+      "id": "i5-cron",
+      "name": "Weekly Sunday 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * 0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "i5-okta",
+      "name": "Fetch Okta Users",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.okta.domain }}/api/v1/users?limit=200&filter=status+eq+%22ACTIVE%22",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=SSWS {{ $credentials.okta.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OKTA_API",
+          "name": "Okta API"
+        }
+      }
+    },
+    {
+      "id": "i5-github",
+      "name": "Fetch GitHub Org Members",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        380
+      ],
+      "parameters": {
+        "url": "=https://api.github.com/orgs/{{ $credentials.githubApi.orgName }}/members",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.githubApi.accessToken }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GITHUB_API",
+          "name": "GitHub API"
+        }
+      }
+    },
+    {
+      "id": "i5-compare",
+      "name": "Find Shadow Accounts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst okta_users=$('Fetch Okta Users').first().json||[];\nconst github_members=$('Fetch GitHub Org Members').first().json||[];\nconst okta_emails=new Set(okta_users.map(u=>(u.profile?.email||'').toLowerCase()));\nconst shadow=[];\nfor(const gh of github_members){\n  const email=(gh.email||'').toLowerCase();\n  // If GitHub member email not in Okta and has @company domain\n  if(email&&email.includes('@')&&!okta_emails.has(email)){\n    shadow.push({platform:'GitHub',username:gh.login,email:gh.email,\n      profile_url:gh.html_url,issue:'Account not in Okta \u2014 possible shadow IT'});\n  }\n}\nreturn[{json:{shadow_accounts:shadow,count:shadow.length,\n  okta_total:okta_users.length,checked_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "i5-jira",
+      "name": "Create Shadow IT Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "IAM",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[SHADOW-IT] {{ $json.count }} unmanaged SaaS accounts detected \u2014 {{ $json.checked_at.split('T')[0] }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.count>5?'High':'Medium' }}"
+          },
+          "labels": [
+            "shadow-it",
+            "saas",
+            "iam"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "i5-slack",
+      "name": "Shadow SaaS Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IAM"
+        },
+        "text": "=\ud83d\udd11 *Shadow SaaS Account Scan*\n\n*Unmanaged Accounts Found:* {{ $json.count }}\n*Okta Total:* {{ $json.okta_total }}\n\n{{ $json.shadow_accounts.slice(0,5).map(a=>'\u26a0\ufe0f ['+a.platform+'] '+a.username+' ('+a.email+')').join('\\n') }}\n\n_These accounts bypass IAM controls. Jira ticket created for remediation._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Sunday 10:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Okta Users",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch GitHub Org Members",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Okta Users": {
+      "main": [
+        [
+          {
+            "node": "Find Shadow Accounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch GitHub Org Members": {
+      "main": [
+        [
+          {
+            "node": "Find Shadow Accounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Shadow Accounts": {
+      "main": [
+        [
+          {
+            "node": "Create Shadow IT Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Shadow IT Ticket": {
+      "main": [
+        [
+          {
+            "node": "Shadow SaaS Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "iam",
+    "workflow_id": "IAM-05",
+    "phase": 2,
+    "description": "Weekly: compares accounts found in known SaaS tools against Okta. Unprovisioned accounts = shadow IT."
+  }
+}

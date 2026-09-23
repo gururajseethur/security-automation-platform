@@ -1,0 +1,262 @@
+{
+  "name": "\ud83d\udcbb EP-03 | Malware Hash Auto-Blocker",
+  "nodes": [
+    {
+      "id": "e3-wh",
+      "name": "New Hash Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "endpoint/new-hash",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "e3-vt",
+      "name": "VirusTotal Hash Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/files/{{ $input.first().json?.raw_data?.sha256 || $input.first().json?.sha256 }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-apikey",
+              "value": "={{ $credentials.virustotalApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "VT_API",
+          "name": "VirusTotal API"
+        }
+      }
+    },
+    {
+      "id": "e3-decide",
+      "name": "Decide Block or Allow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst vt=$input.first().json;\nconst raw=$('New Hash Event').first().json?.raw_data||$('New Hash Event').first().json;\nconst malicious=vt.data?.attributes?.last_analysis_stats?.malicious||0;\nconst total=Object.values(vt.data?.attributes?.last_analysis_stats||{}).reduce((a,b)=>a+b,0)||1;\nconst score=Math.round((malicious/total)*100);\nconst should_block=malicious>=5;\nreturn[{json:{sha256:raw.sha256,hostname:raw.hostname||'unknown',malicious_engines:malicious,vt_score:score,should_block,block_reason:should_block?`${malicious}/${total} VT engines flagged`:'Below block threshold (needs 5+ engines)',detected_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "e3-gate",
+      "name": "Block?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-e3-gate",
+              "leftValue": "={{ $json.should_block }}",
+              "rightValue": true,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e3-cs",
+      "name": "Push to CrowdStrike Blocklist",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1080,
+        200
+      ],
+      "parameters": {
+        "url": "=https://api.crowdstrike.com/iocs/entities/indicators/v1",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"indicators\":[{\"type\":\"sha256\",\"value\":\"{{ $json.sha256 }}\",\"action\":\"prevent\",\"severity\":\"HIGH\",\"description\":\"Auto-blocked by Constellation EP-03 \u2014 {{ $json.block_reason }}\"}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.crowdstrikeApi.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "CROWDSTRIKE_API",
+          "name": "CrowdStrike API"
+        }
+      }
+    },
+    {
+      "id": "e3-slack-block",
+      "name": "Block Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_ENDPOINT_SEC"
+        },
+        "text": "=\ud83d\udcbb *Hash Auto-Blocked*\n\n*SHA256:* `{{ $json.sha256 }}`\n*Host:* {{ $json.hostname }}\n*VT Score:* {{ $json.malicious_engines }} engines ({{ $json.vt_score }}%)\n*Action:* \u2705 Added to CrowdStrike + Wazuh blocklist",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "e3-slack-allow",
+      "name": "Below Threshold",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        420
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_ENDPOINT_SEC"
+        },
+        "text": "=\ud83d\udcbb *Hash Reviewed \u2014 Not Blocked*\n\n*SHA256:* `{{ $json.sha256 }}`\n*VT Score:* {{ $json.malicious_engines }} engines\n*Reason:* {{ $json.block_reason }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "New Hash Event": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Hash Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Hash Lookup": {
+      "main": [
+        [
+          {
+            "node": "Decide Block or Allow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Block or Allow": {
+      "main": [
+        [
+          {
+            "node": "Block?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Block?": {
+      "main": [
+        [
+          {
+            "node": "Push to CrowdStrike Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Below Threshold",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push to CrowdStrike Blocklist": {
+      "main": [
+        [
+          {
+            "node": "Block Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "endpoint",
+    "workflow_id": "EP-03",
+    "phase": 2,
+    "description": "New file hash seen \u2192 VirusTotal lookup \u2192 if \u22655 engines flag malicious \u2192 push to EDR blocklist + Wazuh CDB."
+  }
+}

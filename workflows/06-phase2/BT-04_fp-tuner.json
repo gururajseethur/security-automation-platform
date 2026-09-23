@@ -1,0 +1,164 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-04 | False Positive Auto-Tuner",
+  "nodes": [
+    {
+      "id": "b4-cron",
+      "name": "Weekly Sunday 22:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 22 * * 0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b4-stats",
+      "name": "Compute FP Rates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT\n  ba.rule_id,\n  COUNT(*) as total_alerts,\n  SUM(CASE WHEN af.verdict IN ('false_positive','noise') THEN 1 ELSE 0 END) as fp_count,\n  SUM(CASE WHEN af.verdict = 'true_positive' THEN 1 ELSE 0 END) as tp_count,\n  ROUND(100.0*SUM(CASE WHEN af.verdict IN ('false_positive','noise') THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),1) as fp_rate\nFROM bt_alert_log ba\nJOIN analyst_feedback af ON ba.event_id = af.alert_id\nWHERE ba.processed_at >= NOW() - INTERVAL '7 days'\nGROUP BY ba.rule_id\nHAVING COUNT(*) >= 5\nORDER BY fp_rate DESC;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b4-decide",
+      "name": "Generate Tuning Actions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst rules=$input.all().map(i=>i.json);\nconst actions=[];\nfor(const r of rules){\n  const fp=parseFloat(r.fp_rate);\n  if(fp>=30) actions.push({rule_id:r.rule_id,action:'SUPPRESS',reason:`FP rate ${fp}% exceeds 30% threshold`,fp_rate:fp,total:r.total_alerts});\n  else if(fp>=15) actions.push({rule_id:r.rule_id,action:'RAISE_THRESHOLD',reason:`FP rate ${fp}% \u2014 raise confidence to ${Math.min(95,75+10)}%`,fp_rate:fp,new_threshold:Math.min(95,75+10),total:r.total_alerts});\n  else if(fp<=3&&parseInt(r.total_alerts)>=10) actions.push({rule_id:r.rule_id,action:'LOWER_THRESHOLD',reason:`Only ${fp}% FP \u2014 can lower threshold to catch more`,fp_rate:fp,new_threshold:Math.max(60,75-10),total:r.total_alerts});\n}\nreturn[{json:{actions,suppressed:actions.filter(a=>a.action==='SUPPRESS').length,raised:actions.filter(a=>a.action==='RAISE_THRESHOLD').length,lowered:actions.filter(a=>a.action==='LOWER_THRESHOLD').length,total_rules_analysed:rules.length,analysed_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "b4-apply",
+      "name": "Apply Threshold Updates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO rule_thresholds (rule_id,confidence_threshold,fp_rate,recommendation,updated_at)\nSELECT rule_id, COALESCE(new_threshold,75), fp_rate, LOWER(action), NOW()\nFROM json_to_recordset('[{\"rule_id\":\"placeholder\",\"fp_rate\":0,\"action\":\"no_change\",\"new_threshold\":75}]')\n  AS t(rule_id text,fp_rate numeric,action text,new_threshold int)\nON CONFLICT (rule_id) DO UPDATE SET confidence_threshold=EXCLUDED.confidence_threshold,\n  fp_rate=EXCLUDED.fp_rate, recommendation=EXCLUDED.recommendation, updated_at=NOW();",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b4-slack",
+      "name": "Tuning Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_DETECTION_ENG"
+        },
+        "text": "\ud83d\udee1\ufe0f *Weekly FP Auto-Tuning Report*\n\n*Rules Analysed:* {{ $json.total_rules_analysed }}\n*Suppressed:* {{ $json.suppressed }}\n*Thresholds Raised:* {{ $json.raised }}\n*Thresholds Lowered:* {{ $json.lowered }}\n\n{{ $json.actions.slice(0,5).map(a=>'\u2022 Rule '+a.rule_id+': '+a.action+' \u2014 '+a.reason).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Sunday 22:00": {
+      "main": [
+        [
+          {
+            "node": "Compute FP Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute FP Rates": {
+      "main": [
+        [
+          {
+            "node": "Generate Tuning Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Tuning Actions": {
+      "main": [
+        [
+          {
+            "node": "Apply Threshold Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Threshold Updates": {
+      "main": [
+        [
+          {
+            "node": "Tuning Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "blue-team",
+    "workflow_id": "BT-04",
+    "phase": 1,
+    "description": "Weekly analysis of alert FP rates per rule. Auto-suppresses rules >30% FP. Reports tuning changes to Detection Engineering."
+  }
+}

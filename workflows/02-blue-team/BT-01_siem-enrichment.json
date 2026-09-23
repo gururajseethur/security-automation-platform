@@ -1,0 +1,483 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-01 | SIEM Alert Enrichment & Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-team/siem-enrichment",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "bt-webhook-01",
+      "name": "Receive Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract and normalize SIEM alert fields\n// Supports Wazuh and Splunk payloads\n\nconst payload = $input.first().json;\nconst raw = payload.raw_data || payload;\n\n// Wazuh normalization\nconst srcIp = raw.data?.srcip || raw.agent?.ip || raw.src_ip || raw.source_ip || 'unknown';\nconst dstIp = raw.data?.dstip || raw.dst_ip || raw.destination_ip || 'unknown';\nconst username = raw.data?.dstuser || raw.user?.name || raw.username || raw.user || 'unknown';\nconst ruleId = raw.rule?.id || raw.rule_id || raw.EventID || 'unknown';\nconst ruleDesc = raw.rule?.description || raw.message || raw.msg || 'No description';\nconst ruleLevel = parseInt(raw.rule?.level || raw.severity_score || 5);\nconst agentName = raw.agent?.name || raw.hostname || raw.host || 'unknown';\nconst agentId = raw.agent?.id || raw.host_id || 'unknown';\nconst eventTime = raw.timestamp || raw['@timestamp'] || new Date().toISOString();\n\n// Map Wazuh rule level (1-15) to severity\nlet severity = 'Low';\nif (ruleLevel >= 13) severity = 'Critical';\nelse if (ruleLevel >= 10) severity = 'High';\nelse if (ruleLevel >= 7) severity = 'Medium';\n\nreturn [{\n  json: {\n    _event_id: payload._constellation_event_id || `BT-${Date.now()}`,\n    _received_at: new Date().toISOString(),\n    // Alert fields\n    rule_id: ruleId,\n    rule_desc: ruleDesc,\n    rule_level: ruleLevel,\n    severity,\n    src_ip: srcIp,\n    dst_ip: dstIp,\n    username,\n    agent_name: agentName,\n    agent_id: agentId,\n    event_time: eventTime,\n    // These will be populated by enrichment nodes\n    geo_data: null,\n    vt_score: null,\n    asset_data: null,\n    user_data: null,\n    confidence_score: payload.confidence_score || 50,\n    _raw: raw\n  }\n}];"
+      },
+      "id": "bt-extract-02",
+      "name": "Extract Alert Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://ipapi.co/{{ $json.src_ip }}/json/",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "bt-geoip-03",
+      "name": "GeoIP Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        180
+      ],
+      "notes": "Free tier: 30K/month. Replace with paid provider for production volume."
+    },
+    {
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/ip_addresses/{{ $json.src_ip }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-apikey",
+              "value": "={{ $credentials.virustotalApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "bt-vt-04",
+      "name": "VirusTotal IP Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "VT_API",
+          "name": "VirusTotal API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "cmdb_assets"
+        },
+        "where": {
+          "values": [
+            {
+              "column": "ip_address",
+              "value": "={{ $json.src_ip }}"
+            }
+          ]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "id": "bt-cmdb-05",
+      "name": "CMDB Asset Lookup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500\u2500 CONFIDENCE SCORE ENGINE \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Combines GeoIP, VirusTotal, asset context, and rule severity\n// to produce a final confidence score and triage decision.\n\nconst alert = $('Extract Alert Fields').first().json;\nconst geo = $('GeoIP Lookup').first().json;\nconst vt = $('VirusTotal IP Check').first().json;\nconst assets = $('CMDB Asset Lookup').all();\n\n// \u2500\u2500 GeoIP Signal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst highRiskCountries = ['CN','RU','KP','IR','BY','CU','SY'];\nconst isHighRiskGeo = highRiskCountries.includes(geo.country_code);\nconst isVPN = geo.org?.toLowerCase().includes('vpn') ||\n               geo.org?.toLowerCase().includes('hosting') ||\n               geo.org?.toLowerCase().includes('proxy');\nconst geoRiskScore = isHighRiskGeo ? 85 : isVPN ? 70 : 40;\n\n// \u2500\u2500 VirusTotal Signal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst vtMalicious = vt.data?.attributes?.last_analysis_stats?.malicious || 0;\nconst vtTotal = Object.values(vt.data?.attributes?.last_analysis_stats || {}).reduce((a,b) => a+b, 0) || 1;\nconst vtScore = Math.round((vtMalicious / vtTotal) * 100);\n\n// \u2500\u2500 Asset Signal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst asset = assets.length > 0 ? assets[0].json : null;\nconst assetCriticality = asset?.criticality || 'unknown';\nconst criticalityBoost = { critical: 20, high: 15, medium: 10, low: 5, unknown: 0 }[assetCriticality.toLowerCase()] || 0;\n\n// \u2500\u2500 Rule Level Signal \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst ruleLevelScore = Math.min(100, (alert.rule_level / 15) * 100);\n\n// \u2500\u2500 Composite Confidence \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst confidence = Math.round(\n  (geoRiskScore * 0.25) +\n  (vtScore * 0.30) +\n  (ruleLevelScore * 0.30) +\n  (criticalityBoost * 0.15)\n);\n\n// \u2500\u2500 Triage Decision \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nlet decision = 'MANUAL_REVIEW';\nlet jiraAutoCreate = false;\nif (confidence >= 90) { decision = 'AUTO_TICKET_CRITICAL'; jiraAutoCreate = true; }\nelse if (confidence >= 75) { decision = 'AUTO_TICKET'; jiraAutoCreate = true; }\nelse if (confidence >= 60) { decision = 'ASSISTED_TRIAGE'; }\n\nreturn [{\n  json: {\n    ...alert,\n    // Enrichment results\n    geo_data: {\n      country: geo.country_name,\n      country_code: geo.country_code,\n      city: geo.city,\n      org: geo.org,\n      is_vpn: isVPN,\n      is_high_risk_geo: isHighRiskGeo\n    },\n    vt_score: vtScore,\n    vt_malicious_count: vtMalicious,\n    asset_data: asset,\n    // Scoring\n    confidence_score: confidence,\n    confidence_breakdown: {\n      geo_risk: geoRiskScore,\n      virustotal: vtScore,\n      rule_level: Math.round(ruleLevelScore),\n      asset_criticality: criticalityBoost\n    },\n    triage_decision: decision,\n    jira_auto_create: jiraAutoCreate,\n    // Priority: CRITICAL if severity=Critical AND confidence\u226575\n    jira_priority: alert.severity === 'Critical' && confidence >= 75 ? 'Highest' :\n                   alert.severity === 'High' ? 'High' :\n                   alert.severity === 'Medium' ? 'Medium' : 'Low'\n  }\n}];"
+      },
+      "id": "bt-score-06",
+      "name": "Compute Confidence Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "auto-ticket-check",
+              "leftValue": "={{ $json.jira_auto_create }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "bt-gate-07",
+      "name": "Auto-Create Ticket?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "SOC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[BT-{{ $json._event_id }}] {{ $json.severity }} | {{ $json.rule_desc }} | {{ $json.src_ip }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.jira_priority }}"
+          },
+          "description": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "=*SIEM Alert \u2014 Auto-Generated by Cyber Constellation*\n\n*Event ID:* {{ $json._event_id }}\n*Rule:* {{ $json.rule_id }} \u2014 {{ $json.rule_desc }}\n*Severity:* {{ $json.severity }} (Level {{ $json.rule_level }})\n*Source IP:* {{ $json.src_ip }} ({{ $json.geo_data.country }}, {{ $json.geo_data.org }})\n*Destination:* {{ $json.dst_ip }}\n*User:* {{ $json.username }}\n*Asset:* {{ $json.agent_name }} \u2014 Criticality: {{ $json.asset_data.criticality || 'Unknown' }}\n*Event Time:* {{ $json.event_time }}\n\n---\n*CONFIDENCE SCORE: {{ $json.confidence_score }}%*\n*Decision:* {{ $json.triage_decision }}\n\n*Breakdown:*\n- GeoIP Risk: {{ $json.confidence_breakdown.geo_risk }}% (High-risk geo: {{ $json.geo_data.is_high_risk_geo }}, VPN: {{ $json.geo_data.is_vpn }})\n- VirusTotal: {{ $json.vt_score }}% malicious ({{ $json.vt_malicious_count }} engines flagged)\n- Rule Level: {{ $json.confidence_breakdown.rule_level }}%\n- Asset Criticality Boost: +{{ $json.confidence_breakdown.asset_criticality }}%\n\n---\n*ANALYST ACTIONS REQUIRED:*\n1. Verify source IP {{ $json.src_ip }} is not a known false positive\n2. Check if user {{ $json.username }} has a change ticket for this activity\n3. Review asset {{ $json.agent_name }} for related alerts in last 24hrs\n4. If confirmed malicious: escalate to Incident Response playbook"
+                  }
+                ]
+              }
+            ]
+          },
+          "labels": [
+            "siem",
+            "auto-triage",
+            "={{ $json.severity.toLowerCase() }}"
+          ]
+        }
+      },
+      "id": "bt-jira-08",
+      "name": "Create Jira Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        180
+      ],
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_ALERTS"
+        },
+        "text": "={{ $json.severity === 'Critical' ? '\ud83d\udea8' : $json.severity === 'High' ? '\u26a0\ufe0f' : '\ud83d\udccb' }} *{{ $json.severity }} Alert \u2014 {{ $json.rule_desc }}*\n\n*Confidence:* `{{ $json.confidence_score }}%` | *Decision:* `{{ $json.triage_decision }}`\n*Source:* `{{ $json.src_ip }}` ({{ $json.geo_data.country }}) | VT: `{{ $json.vt_score }}%` malicious\n*Asset:* `{{ $json.agent_name }}` | *User:* `{{ $json.username }}`\n*Jira:* <{{ $('Create Jira Ticket').first().json.self }}|{{ $('Create Jira Ticket').first().json.key }}>",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "bt-slack-auto-09",
+      "name": "Slack: Alert + Ticket",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        180
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_TRIAGE"
+        },
+        "text": "\ud83d\udc41\ufe0f *Manual Triage Required \u2014 Confidence Below Threshold*\n\n*Event ID:* `{{ $json._event_id }}`\n*Confidence:* `{{ $json.confidence_score }}%` (threshold: 75%)\n*Rule:* {{ $json.rule_desc }}\n*Source:* `{{ $json.src_ip }}` ({{ $json.geo_data.country }}) | VT: `{{ $json.vt_score }}%`\n*Asset:* `{{ $json.agent_name }}` | *Severity:* `{{ $json.severity }}`\n\n:point_right: Analyst action required. Review and create ticket manually if confirmed.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "bt-slack-manual-10",
+      "name": "Slack: Manual Triage",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        420
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "bt_alert_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ $json._event_id }}",
+            "rule_id": "={{ $json.rule_id }}",
+            "severity": "={{ $json.severity }}",
+            "src_ip": "={{ $json.src_ip }}",
+            "username": "={{ $json.username }}",
+            "agent_name": "={{ $json.agent_name }}",
+            "confidence_score": "={{ $json.confidence_score }}",
+            "vt_score": "={{ $json.vt_score }}",
+            "geo_country": "={{ $json.geo_data.country }}",
+            "triage_decision": "={{ $json.triage_decision }}",
+            "processed_at": "={{ $json._received_at }}"
+          }
+        }
+      },
+      "id": "bt-log-11",
+      "name": "Log Execution",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Receive Alert": {
+      "main": [
+        [
+          {
+            "node": "Extract Alert Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Alert Fields": {
+      "main": [
+        [
+          {
+            "node": "GeoIP Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "VirusTotal IP Check",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "CMDB Asset Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GeoIP Lookup": {
+      "main": [
+        [
+          {
+            "node": "Compute Confidence Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal IP Check": {
+      "main": [
+        [
+          {
+            "node": "Compute Confidence Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CMDB Asset Lookup": {
+      "main": [
+        [
+          {
+            "node": "Compute Confidence Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Confidence Score": {
+      "main": [
+        [
+          {
+            "node": "Auto-Create Ticket?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Create Ticket?": {
+      "main": [
+        [
+          {
+            "node": "Create Jira Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: Manual Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Jira Ticket": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert + Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Alert + Ticket": {
+      "main": [
+        [
+          {
+            "node": "Log Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Manual Triage": {
+      "main": [
+        [
+          {
+            "node": "Log Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "ORCH-02"
+  },
+  "tags": [
+    {
+      "name": "blue-team"
+    },
+    {
+      "name": "soc"
+    },
+    {
+      "name": "phase-1"
+    },
+    {
+      "name": "production"
+    }
+  ],
+  "meta": {
+    "constellation_version": "1.0",
+    "domain": "blue-team",
+    "agent": "blue-team-agent",
+    "workflow_id": "BT-01",
+    "phase": 1,
+    "confidence_threshold": 75,
+    "false_positive_target": "< 10%",
+    "avg_execution_time_ms": 4500,
+    "credentials_required": [
+      "POSTGRES_MAIN",
+      "SLACK_MAIN",
+      "JIRA_MAIN",
+      "VT_API"
+    ],
+    "webhook_path": "blue-team/siem-enrichment",
+    "triggers": [
+      "siem_alert"
+    ],
+    "description": "Receives raw SIEM alerts, enriches with GeoIP + VirusTotal + CMDB context, computes confidence score, and auto-creates Jira tickets for high-confidence findings."
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "name": "\ud83d\udccb GRC-02 | Risk Register Lifecycle Manager",
+  "nodes": [
+    {
+      "id": "g2-wh",
+      "name": "Risk Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "grc/risk-intake",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "g2-score",
+      "name": "NIST Risk Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst raw=$input.first().json?.raw_data||$input.first().json;\nconst L={'Very Low':1,'Low':2,'Medium':3,'High':4,'Very High':5};\nconst likelihood=L[raw.likelihood]||3;\nconst impact=L[raw.impact]||3;\nconst score=likelihood*impact;\nlet level='Low',sla=90;\nif(score>=16){level='Critical';sla=7;}\nelse if(score>=9){level='High';sla=30;}\nelse if(score>=4){level='Medium';sla=60;}\nconst review_due=new Date(Date.now()+sla*86400000).toISOString().split('T')[0];\nreturn[{json:{...raw,risk_id:`RISK-${Date.now()}`,score,risk_level:level,sla_days:sla,review_due,created_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "g2-jira",
+      "name": "Create Risk Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "GRC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[RISK] {{ $json.risk_level }} | {{ $json.title }} | Score: {{ $json.score }}/25",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.risk_level==='Critical'?'Highest':$json.risk_level==='High'?'High':'Medium' }}"
+          },
+          "labels": [
+            "risk-register"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "g2-db",
+      "name": "Insert Risk Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO risk_register (risk_id,title,category,score,risk_level,owner_email,review_due,status)\nVALUES ('RID','title','cat',0,'Low','owner@co','2024-01-01','Open') ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g2-slack",
+      "name": "Notify GRC Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GRC"
+        },
+        "text": "\ud83d\udccb *New Risk Registered \u2014 {{ $json.risk_level }}*\n\n*Score:* {{ $json.score }}/25\n*Owner:* {{ $json.owner_email }}\n*Review Due:* {{ $json.review_due }}\n*Action:* {{ $json.risk_level==='Critical'?'IMMEDIATE review required':$json.risk_level==='High'?'Review within 30 days':'Standard review' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Risk Intake": {
+      "main": [
+        [
+          {
+            "node": "NIST Risk Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NIST Risk Score": {
+      "main": [
+        [
+          {
+            "node": "Create Risk Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Risk Jira": {
+      "main": [
+        [
+          {
+            "node": "Insert Risk Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Risk Record": {
+      "main": [
+        [
+          {
+            "node": "Notify GRC Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "grc",
+    "workflow_id": "GRC-02",
+    "phase": 1,
+    "description": "Receives risk submissions. Auto-scores Likelihood x Impact (NIST). Creates Jira, inserts risk_register. SLA: Critical=7d, High=30d."
+  }
+}

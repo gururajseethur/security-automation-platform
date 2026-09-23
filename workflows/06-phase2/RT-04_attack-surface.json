@@ -1,0 +1,225 @@
+{
+  "name": "\ud83c\udfaf RT-04 | Attack Surface Monitor (Diff Detection)",
+  "nodes": [
+    {
+      "id": "r4-cron",
+      "name": "Daily 03:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r4-assets",
+      "name": "Fetch Perimeter Assets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT asset_id,hostname,ip_address FROM cmdb_assets WHERE asset_type='perimeter' AND recon_authorized=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "r4-scan",
+      "name": "Simulate Nmap Scan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// In production: exec nmap via n8n Execute Command node\n// nmap -sV -p 1-65535 --open -T4 {ip} -oJ /tmp/scan.json\nconst assets=$input.all().map(i=>i.json);\n// Return mock scan structure \u2014 replace with actual nmap JSON parsing\nreturn assets.map(a=>({json:{asset_id:a.asset_id,ip:a.ip_address,scan_time:new Date().toISOString(),\n  open_ports:[{port:443,service:'https',version:'nginx/1.24'},{port:80,service:'http',version:'nginx/1.24'}]\n}}));"
+      }
+    },
+    {
+      "id": "r4-baseline",
+      "name": "Get Previous Baseline",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT asset_id,open_ports_json FROM attack_surface_baseline WHERE scanned_at=(SELECT MAX(scanned_at) FROM attack_surface_baseline);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "r4-diff",
+      "name": "Diff vs Baseline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst current=$('Simulate Nmap Scan').all().map(i=>i.json);\nconst baseline=$('Get Previous Baseline').all().map(i=>({...i.json,ports:JSON.parse(i.json.open_ports_json||'[]')}));\nconst changes=[];\nfor(const scan of current){\n  const prev=baseline.find(b=>b.asset_id===scan.asset_id);\n  const prevPorts=(prev?.ports||[]).map(p=>p.port);\n  const currPorts=scan.open_ports.map(p=>p.port);\n  const newPorts=currPorts.filter(p=>!prevPorts.includes(p));\n  const closedPorts=prevPorts.filter(p=>!currPorts.includes(p));\n  if(newPorts.length>0) changes.push({asset_id:scan.asset_id,ip:scan.ip,type:'NEW_PORT',ports:newPorts,severity:'High'});\n  if(closedPorts.length>0) changes.push({asset_id:scan.asset_id,ip:scan.ip,type:'CLOSED_PORT',ports:closedPorts,severity:'Info'});\n}\nreturn[{json:{scan_date:new Date().toISOString(),assets_scanned:current.length,changes,change_count:changes.length,new_exposures:changes.filter(c=>c.type==='NEW_PORT').length}}];"
+      }
+    },
+    {
+      "id": "r4-gate",
+      "name": "Changes Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-r4-gate",
+              "leftValue": "={{ $json.new_exposures }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r4-slack",
+      "name": "Alert: New Exposure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_RED_TEAM"
+        },
+        "text": "\ud83c\udfaf *Attack Surface Change Detected*\n\n*New Open Ports:* {{ $json.new_exposures }}\n*Changes:* {{ $json.change_count }}\n\n{{ $json.changes.filter(c=>c.type==='NEW_PORT').map(c=>'\ud83d\udd34 '+c.ip+' \u2014 New port(s): '+c.ports.join(', ')).join('\\n') }}\n\n_All findings on authorized perimeter assets. Verify change control._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 03:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Perimeter Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Perimeter Assets": {
+      "main": [
+        [
+          {
+            "node": "Simulate Nmap Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Nmap Scan": {
+      "main": [
+        [
+          {
+            "node": "Get Previous Baseline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Previous Baseline": {
+      "main": [
+        [
+          {
+            "node": "Diff vs Baseline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff vs Baseline": {
+      "main": [
+        [
+          {
+            "node": "Changes Detected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changes Detected?": {
+      "main": [
+        [
+          {
+            "node": "Alert: New Exposure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "red-team",
+    "workflow_id": "RT-04",
+    "phase": 2,
+    "description": "Runs authorized port scans on owned perimeter assets daily. Diffs against baseline. Alerts on new open ports or services."
+  }
+}

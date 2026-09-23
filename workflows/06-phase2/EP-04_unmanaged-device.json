@@ -1,0 +1,193 @@
+{
+  "name": "\ud83d\udcbb EP-04 | Unmanaged Device Detector",
+  "nodes": [
+    {
+      "id": "e4-cron",
+      "name": "Daily 04:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 4 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e4-mdm",
+      "name": "Fetch Managed MACs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT mac_address,hostname,owner_email FROM mdm_devices WHERE enrolled=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "e4-scan",
+      "name": "Discover Network Hosts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// Production: exec nmap -sn --send-ip 10.0.0.0/24 and parse XML output\n// Mock: returns discovered hosts structure\nreturn[{json:{discovered:[\n  {ip:'10.0.1.10',mac:'AA:BB:CC:DD:EE:01',vendor:'Dell'},\n  {ip:'10.0.1.99',mac:'AA:BB:CC:DD:EE:FF',vendor:'Unknown'},  // unmanaged\n  {ip:'10.0.1.20',mac:'AA:BB:CC:DD:EE:02',vendor:'HP'}\n],scanned_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "e4-compare",
+      "name": "Find Unmanaged Devices",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst managed=$('Fetch Managed MACs').all().map(i=>i.json.mac_address?.toLowerCase());\nconst discovered=$json.discovered||[];\nconst unmanaged=discovered.filter(d=>!managed.includes(d.mac?.toLowerCase()));\nreturn[{json:{unmanaged,count:unmanaged.length,has_unmanaged:unmanaged.length>0,scanned_at:$json.scanned_at}}];"
+      }
+    },
+    {
+      "id": "e4-gate",
+      "name": "Unmanaged Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-e4-gate",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e4-slack",
+      "name": "Unmanaged Device Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_ENDPOINT_SEC"
+        },
+        "text": "=\ud83d\udcbb *Unmanaged Device(s) Detected*\n\n*Count:* {{ $json.count }}\n\n{{ $json.unmanaged.map(d=>'\ud83d\udd34 IP: '+d.ip+' | MAC: '+d.mac+' | Vendor: '+d.vendor).join('\\n') }}\n\n_NOC: Quarantine unknown MACs to VLAN 999. IT Security: investigate ownership._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 04:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Managed MACs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Managed MACs": {
+      "main": [
+        [
+          {
+            "node": "Discover Network Hosts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discover Network Hosts": {
+      "main": [
+        [
+          {
+            "node": "Find Unmanaged Devices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Unmanaged Devices": {
+      "main": [
+        [
+          {
+            "node": "Unmanaged Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unmanaged Found?": {
+      "main": [
+        [
+          {
+            "node": "Unmanaged Device Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "endpoint",
+    "workflow_id": "EP-04",
+    "phase": 2,
+    "description": "Weekly Nmap scan vs MDM inventory. Unknown devices on network \u2192 quarantine VLAN + alert NOC."
+  }
+}

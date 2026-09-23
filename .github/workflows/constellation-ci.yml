@@ -1,0 +1,290 @@
+name: Cyber Constellation CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/sentinel-api
+
+jobs:
+  # ─── 1. Validate Workflow JSONs ─────────────────────────────────────────────
+  validate-workflows:
+    name: Validate n8n Workflow JSONs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate all workflow JSONs
+        run: |
+          python3 << 'EOF'
+          import json, glob, sys, os
+          errors = []
+          total  = 0
+          for f in glob.glob('constellation/workflows/**/*.json', recursive=True):
+              total += 1
+              try:
+                  data = json.load(open(f))
+              except json.JSONDecodeError as e:
+                  errors.append(f"{f}: INVALID JSON — {e}")
+                  continue
+              nodes      = data.get('nodes', [])
+              conns      = data.get('connections', {})
+              node_names = set(n.get('name') for n in nodes)
+              for src, cd in conns.items():
+                  if src not in node_names:
+                      errors.append(f"{f}: Connection source not found: '{src}'")
+                  for branch in cd.get('main', []):
+                      for t in branch:
+                          if t.get('node') and t['node'] not in node_names:
+                              errors.append(f"{f}: Connection target not found: '{t['node']}'")
+              if 'errorWorkflow' not in data.get('settings', {}):
+                  errors.append(f"{f}: WARNING — errorWorkflow not set")
+          print(f"Validated {total} workflows")
+          if errors:
+              for e in errors:
+                  print(f"❌ {e}")
+              sys.exit(1)
+          else:
+              print(f"✅ All {total} workflows valid")
+          EOF
+
+      - name: Validate DB schema
+        run: |
+          python3 << 'EOF'
+          import re, sys
+          with open('constellation/scripts/init_db_COMPLETE.sql') as f:
+              sql = f.read()
+          tables = re.findall(r'CREATE TABLE IF NOT EXISTS (\w+)', sql)
+          indexes = re.findall(r'CREATE INDEX IF NOT EXISTS (\w+)', sql)
+          print(f"✅ DB schema: {len(tables)} tables, {len(indexes)} indexes")
+          if len(tables) < 30:
+              print("❌ Expected at least 30 tables")
+              sys.exit(1)
+          EOF
+
+  # ─── 2. Test Sentinel API ───────────────────────────────────────────────────
+  test-api:
+    name: Test Sentinel API
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: constellation_test
+          POSTGRES_USER: constellation
+          POSTGRES_PASSWORD: testpassword123
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn asyncpg httpx pytest pytest-asyncio PyJWT aiohttp
+
+      - name: Initialize test database
+        run: |
+          PGPASSWORD=testpassword123 psql -h localhost -U constellation -d constellation_test \
+            -f constellation/scripts/init_db_COMPLETE.sql
+          PGPASSWORD=testpassword123 psql -h localhost -U constellation -d constellation_test \
+            -f constellation/scripts/init_multitenancy.sql
+
+      - name: Run API tests
+        env:
+          DATABASE_URL: postgresql://constellation:testpassword123@localhost:5432/constellation_test
+          JWT_SECRET: test-secret-key
+          ENVIRONMENT: test
+        run: |
+          cd constellation/sentinel-api
+          python3 -m pytest tests/ -v --tb=short
+
+  # ─── 3. Lint & Security Scan ────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install security tools
+        run: pip install bandit semgrep
+
+      - name: Run Bandit (Python security scan)
+        run: |
+          bandit -r constellation/sentinel-api/main.py \
+            -l -ii --format json -o bandit-report.json || true
+          python3 -c "
+          import json
+          try:
+              report = json.load(open('bandit-report.json'))
+              highs = [i for i in report.get('results',[]) if i.get('issue_severity')=='HIGH']
+              if highs:
+                  print(f'❌ {len(highs)} HIGH severity issues found')
+                  for h in highs[:3]: print(f'  {h[\"filename\"]}:{h[\"line_number\"]} — {h[\"issue_text\"]}')
+                  exit(1)
+              print(f'✅ No HIGH severity security issues')
+          except Exception as e:
+              print(f'⚠️ Could not parse report: {e}')
+          "
+
+      - name: Check for hardcoded secrets
+        run: |
+          python3 << 'EOF'
+          import re, glob, sys
+          PATTERNS = [
+              r'sk-ant-api[0-9a-zA-Z\-]+',    # Anthropic key
+              r'AKIA[0-9A-Z]{16}',              # AWS key
+              r'ghp_[0-9a-zA-Z]{36}',           # GitHub PAT
+              r'xoxb-[0-9]+-[0-9a-zA-Z]+',     # Slack token
+          ]
+          found = []
+          for f in glob.glob('constellation/**/*.json', recursive=True) + \
+                   glob.glob('constellation/**/*.py', recursive=True) + \
+                   glob.glob('constellation/**/*.sh', recursive=True):
+              try:
+                  content = open(f).read()
+              except: continue
+              for pat in PATTERNS:
+                  if re.search(pat, content):
+                      found.append(f"{f}: potential secret ({pat[:20]})")
+          if found:
+              print('❌ Potential secrets found:')
+              for f in found: print(f'  {f}')
+              sys.exit(1)
+          else:
+              print('✅ No hardcoded secrets detected')
+          EOF
+
+  # ─── 4. Build & Push Docker Image ──────────────────────────────────────────
+  build-push:
+    name: Build & Push Docker Image
+    needs: [validate-workflows, test-api, security-scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: constellation/sentinel-api
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── 5. Deploy to Staging ───────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: staging
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/constellation
+            git pull origin main
+            docker compose pull sentinel-api
+            docker compose up -d sentinel-api
+            sleep 10
+            curl -sf http://localhost:8000/health | grep -q '"ok":true'
+            echo "✅ Staging deployment verified"
+
+  # ─── 6. Deploy to Production (on release only) ──────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event_name == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/constellation
+            # Backup before deploy
+            ./constellation/scripts/backup-workflows.sh /opt/backups
+            # Rolling update
+            docker compose pull sentinel-api
+            docker compose up -d --no-deps sentinel-api
+            sleep 15
+            # Health check
+            curl -sf https://${{ secrets.PROD_DOMAIN }}/health | grep -q '"ok":true'
+            echo "✅ Production deployment verified"
+
+      - name: Notify Slack on success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"✅ *Constellation v${{ github.ref_name }}* deployed to production"}'
+
+      - name: Notify Slack on failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"❌ *Constellation v${{ github.ref_name }}* production deploy FAILED — rollback initiated"}'

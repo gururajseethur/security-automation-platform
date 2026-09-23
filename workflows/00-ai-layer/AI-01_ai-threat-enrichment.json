@@ -1,0 +1,278 @@
+{
+  "name": "\ud83e\udde0 AI-01 | AI Threat Enrichment Layer (Claude API)",
+  "nodes": [
+    {
+      "id": "ai-wh-01",
+      "name": "Enrichment Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai/enrich",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "ai-prep-02",
+      "name": "Build AI Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const p=$input.first().json;\nconst raw=p.raw_data||p;\nconst context={\n  event_id:p._constellation_event_id||p._event_id||`AI-${Date.now()}`,\n  event_type:raw.event_type||raw.type||'security_alert',\n  severity:raw.severity||'Medium',\n  rule_desc:raw.rule_desc||raw.message||'Unknown rule',\n  src_ip:raw.src_ip||raw.source_ip||null,\n  username:raw.username||raw.user||null,\n  asset:raw.agent_name||raw.asset_id||raw.hostname||null,\n  asset_criticality:raw.asset_data&&raw.asset_data.criticality||raw.asset_criticality||'unknown',\n  geo:raw.geo_data||null,\n  vt_score:raw.vt_score||null,\n  confidence_score:raw.confidence_score||p.confidence_score||50,\n  risk_level:raw.risk_level||'Medium'\n};\nreturn[{json:{...p,_ai_context:context}}];"
+      }
+    },
+    {
+      "id": "ai-claude-03",
+      "name": "Claude API \u2014 Threat Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"claude-opus-4-5\",\"max_tokens\":1500,\"system\":\"You are a senior threat analyst in a SOC. Output ONLY valid JSON \u2014 no markdown.\",\"messages\":[{\"role\":\"user\",\"content\":\"Analyze this alert. Return JSON only:\\n\\n{{ JSON.stringify($json._ai_context) }}\\n\\n{\"threat_narrative\":\"string\",\"kill_chain_stage\":\"Reconnaissance|Weaponization|Delivery|Exploitation|Installation|C2|Actions on Objectives|Unknown\",\"mitre_techniques\":[{\"id\":\"T1234\",\"name\":\"string\",\"confidence\":\"High|Medium|Low\"}],\"threat_actor_profile\":\"string\",\"blast_radius\":\"string\",\"immediate_actions\":[\"string\"],\"investigation_queries\":[\"string\"],\"false_positive_indicators\":[\"string\"],\"analyst_verdict_hint\":\"true_positive|false_positive|needs_investigation\",\"urgency\":\"Immediate|Urgent|Normal|Low\",\"confidence_in_analysis\":85}\"}]}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_API",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "ai-parse-04",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const claudeResp=$input.first().json;\nconst originalEvent=$('Build AI Context').first().json;\nconst rawText=claudeResp.content&&claudeResp.content[0]&&claudeResp.content[0].text||'{}';\nlet analysis={};\ntry{\n  const clean=rawText.replace(/```json|```/g,'').trim();\n  analysis=JSON.parse(clean);\n}catch(e){\n  analysis={\n    threat_narrative:'AI parse error: '+rawText.substring(0,100),\n    kill_chain_stage:'Unknown',\n    mitre_techniques:[],\n    immediate_actions:['Manual review required \u2014 AI parsing failed'],\n    urgency:'Normal',\n    analyst_verdict_hint:'needs_investigation',\n    confidence_in_analysis:0,\n    _parse_error:e.message\n  };\n}\nreturn[{json:{\n  ...originalEvent,\n  ai_enrichment:{\n    ...analysis,\n    enriched_at:new Date().toISOString(),\n    model_used:'claude-opus-4-5',\n    tokens_used:(claudeResp.usage&&(claudeResp.usage.input_tokens+claudeResp.usage.output_tokens))||0\n  },\n  kill_chain_stage:analysis.kill_chain_stage,\n  urgency:analysis.urgency,\n  analyst_verdict_hint:analysis.analyst_verdict_hint,\n  threat_narrative:analysis.threat_narrative\n}}];"
+      }
+    },
+    {
+      "id": "ai-update-05",
+      "name": "Update Alert with AI Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bt_alert_log SET ai_narrative=$1, kill_chain_stage=$2, ai_urgency=$3, ai_verdict_hint=$4, ai_enriched_at=NOW() WHERE event_id=$5",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ai-urgentgate-06",
+      "name": "Immediate Urgency?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "urgent-check",
+              "leftValue": "={{ $json.urgency }}",
+              "rightValue": "Immediate",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ai-slack-07",
+      "name": "Slack: AI Threat Brief",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        240
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_ALERTS"
+        },
+        "text": "=\ud83e\udd16 *AI Analysis \u2014 {{ $json.urgency }} Response Required*\n\n*Kill Chain:* `{{ $json.kill_chain_stage }}`\n*Narrative:* {{ $json.threat_narrative }}\n*Verdict Hint:* `{{ $json.analyst_verdict_hint }}`\n\n*Actions:*\n{{ ($json.ai_enrichment&&$json.ai_enrichment.immediate_actions||[]).slice(0,3).map((a,i)=>(i+1)+'. '+a).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "ai-respond-08",
+      "name": "Return Enriched Event",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ event_id: $json._event_id, kill_chain_stage: $json.kill_chain_stage, urgency: $json.urgency, narrative: $json.threat_narrative, verdict_hint: $json.analyst_verdict_hint }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Enrichment Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build AI Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Context": {
+      "main": [
+        [
+          {
+            "node": "Claude API \u2014 Threat Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude API \u2014 Threat Analysis": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Update Alert with AI Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Immediate Urgency?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Immediate Urgency?": {
+      "main": [
+        [
+          {
+            "node": "Slack: AI Threat Brief",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Enriched Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: AI Threat Brief": {
+      "main": [
+        [
+          {
+            "node": "Return Enriched Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "ai-layer",
+    "workflow_id": "AI-01",
+    "phase": 1,
+    "credentials_required": [
+      "POSTGRES_MAIN",
+      "SLACK_MAIN",
+      "ANTHROPIC_API"
+    ],
+    "webhook_path": "ai/enrich",
+    "description": "Calls Claude claude-opus-4-5 on every alert to generate: kill chain stage, MITRE techniques, blast radius, immediate actions, analyst verdict hint."
+  }
+}

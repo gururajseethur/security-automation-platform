@@ -1,0 +1,175 @@
+{
+  "name": "\ud83d\udccb GRC-04 | Vendor Risk Assessment Workflow",
+  "nodes": [
+    {
+      "id": "g4-wh",
+      "name": "Vendor Onboard",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "grc/vendor-onboard",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "g4-score",
+      "name": "Score Vendor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst v=$input.first().json?.raw_data||$input.first().json;\nconst dataMap={'None':0,'Internal':15,'Confidential':30,'PII':45,'Regulated':60};\nconst deployMap={'SaaS':10,'On-Premise':20,'Hybrid':25,'Cloud':15};\nlet score=50;\nscore+=dataMap[v.data_access_level]||15;\nscore+=deployMap[v.deployment_model]||10;\n(v.certifications||[]).forEach(c=>{if(['ISO27001','SOC2','PCI-DSS'].includes(c))score-=10;});\nscore=Math.max(0,Math.min(100,score));\nconst level=score>=70?'High':score>=40?'Medium':'Low';\nreturn[{json:{...v,vendor_id:`VEN-${Date.now()}`,risk_score:score,risk_level:level,\n  review_due:new Date(Date.now()+(level==='High'?7:level==='Medium'?14:30)*86400000).toISOString().split('T')[0]}}];"
+      }
+    },
+    {
+      "id": "g4-jira",
+      "name": "Create Vendor Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "GRC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[VENDOR] {{ $json.vendor_name }} | {{ $json.risk_level }} Risk | Score: {{ $json.risk_score }}/100",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.risk_level==='High'?'High':'Medium' }}"
+          },
+          "labels": [
+            "vendor-risk"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "g4-db",
+      "name": "Insert Vendor",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO vendor_risk_register (vendor_id,vendor_name,risk_score,risk_level,review_due,status)\nVALUES ('VID','vendor',0,'Low','2024-01-01','Pending Review') ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g4-slack",
+      "name": "Notify GRC",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GRC"
+        },
+        "text": "\ud83d\udccb *New Vendor Assessment \u2014 {{ $json.risk_level }} Risk*\n\n*Vendor:* {{ $json.vendor_name }}\n*Score:* {{ $json.risk_score }}/100\n*Data Access:* {{ $json.data_access_level }}\n*Action:* {{ $json.risk_level==='High'?'Full security review required':'Standard DPA sufficient' }}\n*Review Due:* {{ $json.review_due }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Vendor Onboard": {
+      "main": [
+        [
+          {
+            "node": "Score Vendor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Vendor": {
+      "main": [
+        [
+          {
+            "node": "Create Vendor Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Vendor Jira": {
+      "main": [
+        [
+          {
+            "node": "Insert Vendor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Vendor": {
+      "main": [
+        [
+          {
+            "node": "Notify GRC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "grc",
+    "workflow_id": "GRC-04",
+    "phase": 1,
+    "description": "Scores vendors on data access, deployment, certifications, geography. Score 0-100. High>=70 needs full review. Creates Jira."
+  }
+}

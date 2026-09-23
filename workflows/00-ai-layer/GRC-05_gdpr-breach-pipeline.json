@@ -1,0 +1,234 @@
+{
+  "name": "\ud83d\udccb GRC-05 | GDPR Breach 72hr Notification Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "grc/gdpr-breach",
+        "responseMode": "lastNode"
+      },
+      "id": "gdpr-wh-01",
+      "name": "Breach Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "notes": "Triggered by DLP system, SIEM rule, or manual declaration. Payload: breach_type, affected_records, affected_data_categories, discovery_time, systems_affected"
+    },
+    {
+      "parameters": {
+        "jsCode": "const p=$input.first().json;const raw=p.raw_data||p;\nconst discovery=new Date(raw.discovery_time||Date.now());\nconst deadline72h=new Date(discovery.getTime()+72*3600000);\nconst now=new Date();\nconst hoursRemaining=Math.round((deadline72h-now)/3600000);\n\n// GDPR Article 33 threshold: 250+ records OR sensitive categories always notifiable\nconst SENSITIVE_CATEGORIES=['health','biometric','financial','children','criminal','political','religious'];\nconst hasSensitive=(raw.affected_data_categories||[]).some(c=>SENSITIVE_CATEGORIES.includes(c.toLowerCase()));\nconst mustNotify=parseInt(raw.affected_records||0)>=250||hasSensitive||raw.force_notify===true;\n\nreturn[{json:{_breach_id:`GDPR-${Date.now()}`,_discovered_at:discovery.toISOString(),_deadline_72h:deadline72h.toISOString(),_hours_remaining:hoursRemaining,_must_notify:mustNotify,breach_type:raw.breach_type||'unauthorized_access',affected_records:parseInt(raw.affected_records||0),affected_data_categories:raw.affected_data_categories||[],systems_affected:raw.systems_affected||[],discovered_by:raw.discovered_by||'automated',description:raw.description||'Data breach detected',has_sensitive_data:hasSensitive,risk_to_individuals:hasSensitive||raw.affected_records>1000?'High':'Medium'}}];}"
+      },
+      "id": "gdpr-assess-02",
+      "name": "Assess Notifiability",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_LEGAL_PRIVACY"
+        },
+        "text": "\ud83d\udd34 *GDPR DATA BREACH DECLARED*\n\n*Breach ID:* `{{ $json._breach_id }}`\n*Type:* {{ $json.breach_type }}\n*Records:* {{ $json.affected_records.toLocaleString() }}\n*Sensitive Data:* {{ $json.has_sensitive_data ? '\u26a0\ufe0f YES \u2014 ' + $json.affected_data_categories.join(', ') : 'No' }}\n*DPA Notification Required:* {{ $json._must_notify ? '\u2705 YES' : '\u274c No (low risk)' }}\n*72hr Deadline:* {{ $json._deadline_72h }}\n*Hours Remaining:* {{ $json._hours_remaining }}hrs\n\n:alarm_clock: DPO and Legal must be notified immediately.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "gdpr-notify-03",
+      "name": "Alert DPO + Legal",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        640,
+        200
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "GRC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "GDPR Incident",
+          "mode": "name"
+        },
+        "summary": "=[GDPR-BREACH] {{ $json._breach_id }} | {{ $json.affected_records }} records | Deadline: {{ $json._deadline_72h }}",
+        "additionalFields": {
+          "priority": {
+            "name": "Highest"
+          },
+          "labels": [
+            "gdpr",
+            "data-breach",
+            "legal",
+            "dpa-notification"
+          ]
+        }
+      },
+      "id": "gdpr-jira-04",
+      "name": "Create GDPR Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        640,
+        340
+      ],
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        },
+        "waitForExecution": true
+      },
+      "id": "gdpr-timer-05",
+      "name": "6hr Reminder Timer",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT _breach_id, _hours_remaining, jira_key FROM gdpr_breach_log WHERE _breach_id='{{ $json._breach_id }}' AND notification_submitted=false;",
+        "options": {}
+      },
+      "id": "gdpr-check-06",
+      "name": "Check if Notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "gdpr_breach_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "breach_id": "={{ $json._breach_id }}",
+            "breach_type": "={{ $json.breach_type }}",
+            "affected_records": "={{ $json.affected_records }}",
+            "must_notify": "={{ $json._must_notify }}",
+            "discovery_time": "={{ $json._discovered_at }}",
+            "deadline_72h": "={{ $json._deadline_72h }}",
+            "jira_key": "={{ $('Create GDPR Jira').first().json.key }}",
+            "notification_submitted": "=false",
+            "risk_level": "={{ $json.risk_to_individuals }}",
+            "evidence_json": "={{ JSON.stringify({categories:$json.affected_data_categories,systems:$json.systems_affected}) }}"
+          }
+        }
+      },
+      "id": "gdpr-log-07",
+      "name": "Log Breach",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Breach Intake": {
+      "main": [
+        [
+          {
+            "node": "Assess Notifiability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assess Notifiability": {
+      "main": [
+        [
+          {
+            "node": "Alert DPO + Legal",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create GDPR Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create GDPR Jira": {
+      "main": [
+        [
+          {
+            "node": "Log Breach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "grc",
+    "workflow_id": "GRC-05",
+    "phase": 1,
+    "description": "GDPR Article 33 breach notification pipeline. Assesses notifiability (250+ records or sensitive categories = must notify DPA within 72hrs). Creates Jira, alerts DPO, logs evidence, tracks 72hr countdown."
+  }
+}

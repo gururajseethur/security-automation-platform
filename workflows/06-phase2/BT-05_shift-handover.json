@@ -1,0 +1,206 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-05 | Shift Handover Briefing Generator",
+  "nodes": [
+    {
+      "id": "b5-cron",
+      "name": "Shift End (08:00 & 20:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8,20 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b5-open",
+      "name": "Fetch Open Alerts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT event_id,severity,rule_id,src_ip,username,triage_decision,confidence_score,processed_at FROM bt_alert_log WHERE triage_decision='MANUAL_REVIEW' AND processed_at >= NOW() - INTERVAL '12 hours' ORDER BY processed_at DESC;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b5-incidents",
+      "name": "Fetch Active Incidents",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT incident_id,type,severity,team,due_at,jira_key,created_at FROM incidents WHERE status='Open' ORDER BY CASE severity WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 ELSE 3 END;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b5-corr",
+      "name": "Active Correlations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        580
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT correlation_id,type,pivot,severity,alert_count,mitre_hypothesis FROM correlated_incidents WHERE resolution IS NULL AND created_at >= NOW() - INTERVAL '12 hours';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b5-build",
+      "name": "Build Handover Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        380
+      ],
+      "parameters": {
+        "jsCode": "\nconst alerts=$('Fetch Open Alerts').all().map(i=>i.json);\nconst incidents=$('Fetch Active Incidents').all().map(i=>i.json);\nconst corr=$('Active Correlations').all().map(i=>i.json);\nconst shift=new Date().getHours()<12?'Night':'Day';\nconst nextShift=shift==='Night'?'Day':'Night';\nconst brief={shift_ending:shift,shift_starting:nextShift,handover_time:new Date().toISOString(),\n  pending_triage:alerts.length,open_incidents:incidents.length,active_correlations:corr.length,\n  critical_count:incidents.filter(i=>i.severity==='Critical').length,\n  top_alerts:alerts.slice(0,5),top_incidents:incidents.slice(0,3),correlations:corr.slice(0,3)};\nreturn[{json:brief}];"
+      }
+    },
+    {
+      "id": "b5-slack",
+      "name": "Post Handover Brief",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_HANDOVER"
+        },
+        "text": "=\ud83d\udccb *{{ $json.shift_ending }} Shift Handover \u2192 {{ $json.shift_starting }} Shift*\n\n*Time:* {{ $json.handover_time }}\n*Pending Triage:* {{ $json.pending_triage }}\n*Open Incidents:* {{ $json.open_incidents }} ({{ $json.critical_count }} Critical)\n*Active Correlations:* {{ $json.active_correlations }}\n\n{{ $json.top_incidents.length>0?'*\ud83d\udea8 Active Incidents:*\\n'+$json.top_incidents.map(i=>'\u2022 ['+i.severity+'] '+i.incident_id+' \u2014 '+i.type+' | Jira: '+i.jira_key).join('\\n')+'\\n\\n':'' }}{{ $json.top_alerts.length>0?'*\u26a0\ufe0f Pending Triage:*\\n'+$json.top_alerts.map(a=>'\u2022 '+a.severity+' | Rule: '+a.rule_id+' | '+a.src_ip).join('\\n'):'' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shift End (08:00 & 20:00)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Alerts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Active Incidents",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Active Correlations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open Alerts": {
+      "main": [
+        [
+          {
+            "node": "Build Handover Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Active Incidents": {
+      "main": [
+        [
+          {
+            "node": "Build Handover Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Active Correlations": {
+      "main": [
+        [
+          {
+            "node": "Build Handover Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Handover Brief": {
+      "main": [
+        [
+          {
+            "node": "Post Handover Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "blue-team",
+    "workflow_id": "BT-05",
+    "phase": 1,
+    "description": "End-of-shift: queries open tickets, alerts, incidents, active correlations. Generates formatted handover posted to Slack."
+  }
+}

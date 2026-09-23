@@ -1,0 +1,147 @@
+{
+  "name": "\ud83d\udd11 IAM-03 | MFA Enrollment Enforcer",
+  "nodes": [
+    {
+      "id": "i3-cron",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "i3-okta",
+      "name": "Fetch Non-MFA Users",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.okta.domain }}/api/v1/users?filter=status+eq+%22ACTIVE%22&limit=200",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=SSWS {{ $credentials.okta.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OKTA_API",
+          "name": "Okta API"
+        }
+      }
+    },
+    {
+      "id": "i3-classify",
+      "name": "Classify Users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst users=$input.first().json||[];\nconst now=Date.now();\nconst noMfa=users.filter(u=>{\n  const factors=u._embedded?.factors||[];\n  return !factors.some(f=>f.status==='ACTIVE');\n});\nconst classified=noMfa.map(u=>{\n  const hours=Math.floor((now-new Date(u.created))/3600000);\n  const isPriv=(u.profile?.userType||'').toLowerCase().includes('admin');\n  let action='FIRST_REMINDER';\n  if(isPriv&&hours>48) action='SUSPEND';\n  else if(hours>48) action='ESCALATE';\n  else if(hours>24) action='FINAL_REMINDER';\n  return{...u.profile,user_id:u.id,hours_since_created:hours,is_privileged:isPriv,action};\n});\nconst byAction={};\nclassified.forEach(u=>{if(!byAction[u.action])byAction[u.action]=[];byAction[u.action].push(u);});\nreturn[{json:{total:users.length,no_mfa:noMfa.length,by_action:byAction,\n  suspend_count:(byAction.SUSPEND||[]).length,escalate_count:(byAction.ESCALATE||[]).length}}];"
+      }
+    },
+    {
+      "id": "i3-slack",
+      "name": "MFA Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IAM"
+        },
+        "text": "\ud83d\udd11 *Daily MFA Compliance*\n\n*Without MFA:* {{ $json.no_mfa }}/{{ $json.total }}\n{{ $json.suspend_count>0?'\ud83d\udd34 SUSPENDED (privileged >48h): '+$json.suspend_count+'\\n':'' }}{{ $json.escalate_count>0?'\u26a0\ufe0f ESCALATED (>48h): '+$json.escalate_count+'\\n':'' }}{{ ($json.by_action.FINAL_REMINDER||[]).length>0?'\ud83d\udd14 Final Reminder: '+(($json.by_action.FINAL_REMINDER||[]).length)+'\\n':'' }}{{ ($json.by_action.FIRST_REMINDER||[]).length>0?'\ud83d\udce7 First Reminder: '+(($json.by_action.FIRST_REMINDER||[]).length):'\u2705 All compliant' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Non-MFA Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Non-MFA Users": {
+      "main": [
+        [
+          {
+            "node": "Classify Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Users": {
+      "main": [
+        [
+          {
+            "node": "MFA Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "iam",
+    "workflow_id": "IAM-03",
+    "phase": 1,
+    "description": "Daily MFA scan. <24h=first reminder, 24-48h=final reminder, >48h=escalate to manager, >48h+privileged=suspend account."
+  }
+}

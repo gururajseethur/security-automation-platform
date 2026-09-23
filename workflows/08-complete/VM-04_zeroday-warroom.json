@@ -1,0 +1,227 @@
+{
+  "name": "\ud83d\udd2c VM-04 | Zero-Day Response War Room",
+  "nodes": [
+    {
+      "id": "v4-wh",
+      "name": "Zero-Day Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vuln-mgmt/zero-day",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "v4-init",
+      "name": "Initialize War Room",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst war_room_id=`WAR-${Date.now()}`;\nconst deadline_15min=new Date(Date.now()+15*60000).toISOString();\nconst deadline_1hr=new Date(Date.now()+3600000).toISOString();\nreturn[{json:{war_room_id,cve_id:evt.cve_id||evt.vulnerability_id||'CVE-UNKNOWN',\n  title:evt.title||evt.description||'Zero-Day Vulnerability',\n  cvss_score:parseFloat(evt.cvss_score||10),\n  affected_products:evt.affected_products||[],\n  exploited_in_wild:evt.exploited_in_wild||false,\n  reporter:evt.reporter||'automated',\n  deadline_acknowledge:deadline_15min,\n  deadline_mitigation:deadline_1hr,\n  created_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "v4-jira",
+      "name": "Create P0 Incident",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "SOC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[P0-ZERODAY] {{ $json.cve_id }} | {{ $json.title }} | CVSS {{ $json.cvss_score }}",
+        "additionalFields": {
+          "priority": {
+            "name": "Highest"
+          },
+          "labels": [
+            "p0",
+            "zero-day",
+            "war-room",
+            "critical"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "v4-channel",
+      "name": "Create Slack War Room Channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        480
+      ],
+      "parameters": {
+        "url": "https://slack.com/api/conversations.create",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"name\":\"war-room-{{ $json.cve_id.toLowerCase().replace(/[^a-z0-9]/g,'-') }}-{{ new Date().toISOString().split('T')[0] }}\",\"is_private\":true}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.slackApi.token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "v4-slack",
+      "name": "War Room Activated",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_INCIDENTS"
+        },
+        "text": "=\ud83d\udea8\ud83d\udea8\ud83d\udea8 *P0 ZERO-DAY WAR ROOM ACTIVATED*\n\n*CVE:* `{{ $json.cve_id }}`\n*Title:* {{ $json.title }}\n*CVSS:* {{ $json.cvss_score }}/10\n*Exploited in Wild:* {{ $json.exploited_in_wild?'\ud83d\udd34 YES \u2014 CRITICAL URGENCY':'Not confirmed' }}\n*Jira:* {{ $('Create P0 Incident').first().json.key }}\n\n\u23f0 *Acknowledge by:* {{ $json.deadline_acknowledge }}\n\u23f0 *Mitigation by:* {{ $json.deadline_mitigation }}\n\n@channel \u2014 ALL HANDS. Assign yourself to action items in Jira immediately.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "v4-log",
+      "name": "Log War Room",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO zero_day_incidents (war_room_id,cve_id,title,cvss_score,exploited_in_wild,jira_key,created_at) VALUES ('WID','CVE','title',10,false,'KEY',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Zero-Day Alert": {
+      "main": [
+        [
+          {
+            "node": "Initialize War Room",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize War Room": {
+      "main": [
+        [
+          {
+            "node": "Create P0 Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create P0 Incident": {
+      "main": [
+        [
+          {
+            "node": "Create Slack War Room Channel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "War Room Activated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "War Room Activated": {
+      "main": [
+        [
+          {
+            "node": "Log War Room",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "vuln-mgmt",
+    "workflow_id": "VM-04",
+    "phase": 2,
+    "description": "0-day detected \u2192 immediately create war room Slack channel + Jira P0 \u2192 assign response leads \u2192 15-min SLA countdown."
+  }
+}

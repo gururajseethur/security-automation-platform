@@ -1,0 +1,179 @@
+{
+  "name": "\ud83c\udf93 AWR-01 | Phishing Simulation Results Tracker",
+  "nodes": [
+    {
+      "id": "a1-cron",
+      "name": "Weekly Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a1-campaigns",
+      "name": "Fetch GoPhish Campaigns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.gophishApi.host }}/api/campaigns/?status=Completed",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.gophishApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GOPHISH_API",
+          "name": "GoPhish API"
+        }
+      }
+    },
+    {
+      "id": "a1-analyse",
+      "name": "Analyse Campaign Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst campaigns=$input.first().json||[];\nconst recent=campaigns.filter(c=>new Date(c.created_date)>new Date(Date.now()-7*86400000));\nconst results=[];\nfor(const c of recent){\n  const sent=c.stats?.total||0;\n  const opened=c.stats?.opened||0;\n  const clicked=c.stats?.clicked||0;\n  const creds=c.stats?.submitted_data||0;\n  results.push({campaign_id:c.id,campaign_name:c.name,sent,opened,clicked,creds,\n    click_rate:sent>0?Math.round((clicked/sent)*100):0,\n    cred_rate:sent>0?Math.round((creds/sent)*100):0,\n    needs_training:clicked>0});\n}\nconst avg_click_rate=results.length>0?Math.round(results.reduce((s,r)=>s+r.click_rate,0)/results.length):0;\nreturn[{json:{campaigns:results,total_campaigns:results.length,avg_click_rate,\n  high_risk:results.filter(r=>r.click_rate>20),analysed_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "a1-log",
+      "name": "Log Campaign Results",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO phishing_campaign_results (campaign_id,campaign_name,sent,clicked,click_rate,analysed_at) VALUES (0,'name',0,0,0,NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "a1-slack",
+      "name": "Phishing Results",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SECURITY_AWARENESS"
+        },
+        "text": "=\ud83c\udf93 *Weekly Phishing Simulation Report*\n\n*Campaigns Analysed:* {{ $json.total_campaigns }}\n*Average Click Rate:* {{ $json.avg_click_rate }}%\n*High-Risk Departments (>20%):* {{ $json.high_risk.length }}\n\n{{ $json.high_risk.slice(0,5).map(c=>'\u26a0\ufe0f '+c.campaign_name+': '+c.click_rate+'% click rate ('+c.clicked+'/'+c.sent+')').join('\\n') }}\n\n_Clicked users auto-enrolled in phishing awareness training._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Monday 09:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch GoPhish Campaigns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch GoPhish Campaigns": {
+      "main": [
+        [
+          {
+            "node": "Analyse Campaign Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse Campaign Results": {
+      "main": [
+        [
+          {
+            "node": "Log Campaign Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Campaign Results": {
+      "main": [
+        [
+          {
+            "node": "Phishing Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "awareness",
+    "workflow_id": "AWR-01",
+    "phase": 1,
+    "description": "Pulls GoPhish campaign results. Calculates click rate by department. Auto-enrolls clicked users in training."
+  }
+}

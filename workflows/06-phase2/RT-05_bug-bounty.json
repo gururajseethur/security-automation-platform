@@ -1,0 +1,196 @@
+{
+  "name": "\ud83c\udfaf RT-05 | Bug Bounty Result Ingestion",
+  "nodes": [
+    {
+      "id": "r5-cron",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */6 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r5-h1",
+      "name": "Fetch HackerOne Reports",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.hackerone.com/v1/reports?filter[program][]=your-program&filter[state][]=new&page[size]=20",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from($credentials.h1Api.apiId+':'+$credentials.h1Api.apiKey).toString('base64') }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "H1_API",
+          "name": "HackerOne API"
+        }
+      }
+    },
+    {
+      "id": "r5-triage",
+      "name": "Triage Reports",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst reports=$input.first().json?.data||[];\nconst triaged=reports.map(r=>{\n  const sev=r.attributes?.severity_rating||'none';\n  const sevMap={'critical':1,'high':2,'medium':3,'low':4,'none':5};\n  const priority=sevMap[sev]<=2?'Highest':sevMap[sev]===3?'High':'Medium';\n  const sla_hours=sev==='critical'?4:sev==='high'?24:72;\n  return{report_id:r.id,title:r.attributes?.title,severity:sev,state:r.attributes?.state,\n    reporter:r.relationships?.reporter?.data?.id,priority,sla_hours,\n    due_at:new Date(Date.now()+sla_hours*3600000).toISOString(),\n    submitted_at:r.attributes?.created_at};\n});\nconst actionable=triaged.filter(r=>['critical','high'].includes(r.severity));\nreturn[{json:{total:triaged.length,actionable:actionable.length,reports:actionable}}];"
+      }
+    },
+    {
+      "id": "r5-jira",
+      "name": "Create Bug Bounty Tickets",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "REDTEAM",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[BUG-BOUNTY] {{ $json.severity?.toUpperCase() }} | {{ $json.title }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.priority }}"
+          },
+          "labels": [
+            "bug-bounty",
+            "h1"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "r5-slack",
+      "name": "Bug Bounty Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_RED_TEAM"
+        },
+        "text": "\ud83c\udfaf *Bug Bounty Digest*\n\n*New Reports:* {{ $json.total }}\n*Actionable (Critical/High):* {{ $json.actionable }}\n\n{{ ($json.reports||[]).slice(0,3).map(r=>(r.severity==='critical'?'\ud83d\udd34':'\u26a0\ufe0f')+' ['+r.severity.toUpperCase()+'] '+r.title+' \u2014 SLA: '+r.sla_hours+'hr').join('\\n') }}\n\n_Jira tickets created for all actionable findings._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch HackerOne Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch HackerOne Reports": {
+      "main": [
+        [
+          {
+            "node": "Triage Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage Reports": {
+      "main": [
+        [
+          {
+            "node": "Create Bug Bounty Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Bug Bounty Tickets": {
+      "main": [
+        [
+          {
+            "node": "Bug Bounty Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "red-team",
+    "workflow_id": "RT-05",
+    "phase": 2,
+    "description": "Polls HackerOne/Bugcrowd API for new reports. Scores by severity. Creates Jira tickets. Tracks SLA for responses."
+  }
+}

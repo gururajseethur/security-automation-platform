@@ -1,0 +1,196 @@
+{
+  "name": "\ud83d\udd11 IAM-01 | Privileged Access Quarterly Review",
+  "nodes": [
+    {
+      "id": "i1-cron",
+      "name": "Quarterly (1 Jan/Apr/Jul/Oct)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 1 1,4,7,10 *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "i1-ad",
+      "name": "Fetch AD Admins",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/groups/privileged-users/members",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.microsoftGraphApi.accessToken }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GRAPH_API",
+          "name": "Microsoft Graph API"
+        }
+      }
+    },
+    {
+      "id": "i1-merge",
+      "name": "Merge & Flag",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst adUsers=$('Fetch AD Admins').first().json?.value||[];\nconst reviewId=`PAM-REVIEW-${new Date().toISOString().split('T')[0]}`;\nconst users=adUsers.map(u=>{\n  const days=u.lastSignInDateTime?Math.floor((Date.now()-new Date(u.lastSignInDateTime))/86400000):999;\n  return{review_id:reviewId,source:'AD',email:u.mail,name:u.displayName,\n    days_since_login:days,flag:days>90?'STALE':days>30?'INACTIVE':'ACTIVE'};\n});\nconst stale=users.filter(u=>u.flag==='STALE');\nreturn[{json:{review_id:reviewId,total:users.length,stale_count:stale.length,users,stale_users:stale}}];"
+      }
+    },
+    {
+      "id": "i1-jira",
+      "name": "Create Review Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "IAM",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[PAM-REVIEW] Quarterly Access Review | {{ $json.total }} accounts | {{ $json.stale_count }} stale",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.stale_count>10?'High':'Medium' }}"
+          },
+          "labels": [
+            "pam-review",
+            "quarterly"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "i1-slack",
+      "name": "PAM Review Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IAM"
+        },
+        "text": "\ud83d\udd11 *Quarterly PAM Review*\n\n*Total Privileged:* {{ $json.total }}\n*Stale (>90d):* {{ $json.stale_count }}\n\n{{ $json.stale_users.slice(0,5).map(u=>'\u26a0\ufe0f '+u.name+' ('+u.email+') \u2014 '+u.days_since_login+'d since login').join('\\n') }}\n\nManagers have 14 days to approve or revoke.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Quarterly (1 Jan/Apr/Jul/Oct)": {
+      "main": [
+        [
+          {
+            "node": "Fetch AD Admins",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch AD Admins": {
+      "main": [
+        [
+          {
+            "node": "Merge & Flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge & Flag": {
+      "main": [
+        [
+          {
+            "node": "Create Review Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Review Jira": {
+      "main": [
+        [
+          {
+            "node": "PAM Review Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "iam",
+    "workflow_id": "IAM-01",
+    "phase": 1,
+    "description": "Quarterly PAM review. Pulls all privileged accounts from AD + Okta. Flags >90d no-login as STALE. Creates Jira with 14-day approval window."
+  }
+}

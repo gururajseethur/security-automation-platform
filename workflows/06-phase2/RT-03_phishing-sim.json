@@ -1,0 +1,159 @@
+{
+  "name": "\ud83c\udfaf RT-03 | Phishing Simulation Orchestrator",
+  "nodes": [
+    {
+      "id": "r3-cron",
+      "name": "Monthly (15th)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 15 * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r3-targets",
+      "name": "Fetch Target Groups",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT department, COUNT(*) as count, array_agg(email) as emails FROM staff WHERE active=true AND phishing_sim_authorized=true GROUP BY department ORDER BY count DESC LIMIT 5;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "r3-campaign",
+      "name": "Launch GoPhish Campaign",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.gophishApi.host }}/api/campaigns/",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"name\":\"Constellation-Sim-{{ new Date().toISOString().split('T')[0] }}\",\"template\":{\"name\":\"Standard Phish\"},\"url\":\"https://sim.constellation.local\",\"launch_date\":\"{{ new Date(Date.now()+86400000).toISOString() }}\",\"send_by_date\":\"{{ new Date(Date.now()+7*86400000).toISOString() }}\",\"groups\":[{\"name\":\"All Staff\"}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.gophishApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GOPHISH_API",
+          "name": "GoPhish API"
+        }
+      }
+    },
+    {
+      "id": "r3-slack",
+      "name": "Sim Launched",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_RED_TEAM"
+        },
+        "text": "\ud83c\udfaf *Phishing Simulation Launched*\n\n*Target Groups:* {{ $('Fetch Target Groups').all().length }} departments\n*GoPhish Campaign:* `{{ $json.name }}`\n*Status:* {{ $json.status }}\n*Results available:* +7 days\n\n_Authorized simulation. Results route to Security Awareness for training._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Monthly (15th)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Target Groups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Target Groups": {
+      "main": [
+        [
+          {
+            "node": "Launch GoPhish Campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Launch GoPhish Campaign": {
+      "main": [
+        [
+          {
+            "node": "Sim Launched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "red-team",
+    "workflow_id": "RT-03",
+    "phase": 2,
+    "description": "Schedules and tracks authorized phishing simulations. Integrates with GoPhish. Routes click-data to awareness training."
+  }
+}

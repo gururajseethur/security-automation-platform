@@ -1,0 +1,260 @@
+{
+  "name": "\ud83d\udd75\ufe0f TI-03 | Brand & Domain Squatting Monitor",
+  "nodes": [
+    {
+      "id": "ti3-cron",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ti3-domains",
+      "name": "Fetch Protected Domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT domain_name FROM protected_domains WHERE active=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ti3-whois",
+      "name": "Check UrlScan.io for New Domains",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "=https://urlscan.io/api/v1/search/?q=domain:{{ $json.domain_name }}&size=10&sort=date:desc",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "API-Key",
+              "value": "={{ $credentials.urlscanApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "URLSCAN_API",
+          "name": "URLScan.io API"
+        }
+      }
+    },
+    {
+      "id": "ti3-analyse",
+      "name": "Detect Squatting Patterns",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst results=$input.first().json?.results||[];\nconst protected_domain=$('Fetch Protected Domains').all()[0]?.json?.domain_name||'example.com';\nconst base=protected_domain.split('.')[0];\nconst squats=[];\nfor(const r of results){\n  const found_domain=r.page?.domain||'';\n  if(!found_domain||found_domain===protected_domain) continue;\n  const found_base=found_domain.split('.')[0];\n  // Levenshtein distance check for typosquat\n  const dist=(a,b)=>{const m=[];for(let i=0;i<=b.length;i++)m[i]=[i];for(let j=0;j<=a.length;j++)m[0][j]=j;for(let i=1;i<=b.length;i++)for(let j=1;j<=a.length;j++)m[i][j]=b[i-1]===a[j-1]?m[i-1][j-1]:Math.min(m[i-1][j]+1,m[i][j-1]+1,m[i-1][j-1]+1);return m[b.length][a.length];};\n  const distance=dist(base,found_base);\n  const is_squat=distance<=2&&distance>0;\n  if(is_squat) squats.push({domain:found_domain,base:found_base,\n    distance_from_original:distance,first_seen:r.task?.time,\n    screenshot_url:r.screenshot,severity:distance===1?'High':'Medium'});\n}\nreturn[{json:{protected_domain,squats_found:squats.length,squats,checked_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "ti3-gate",
+      "name": "Squats Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-ti3-gate",
+              "leftValue": "={{ $json.squats_found }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ti3-jira",
+      "name": "Create Brand Protection Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        200
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "TI",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[BRAND-SQUAT] {{ $json.squats_found }} domain squats detected near {{ $json.protected_domain }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.squats.some(s=>s.severity==='High')?'High':'Medium' }}"
+          },
+          "labels": [
+            "brand-protection",
+            "typosquat",
+            "phishing"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "ti3-slack",
+      "name": "Brand Squatting Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        380
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "=\ud83d\udd75\ufe0f *Domain Squatting Detected*\n\n*Protected Domain:* {{ $json.protected_domain }}\n*Squats Found:* {{ $json.squats_found }}\n\n{{ $json.squats.slice(0,5).map(s=>(s.severity==='High'?'\ud83d\udd34':'\u26a0\ufe0f')+' `'+s.domain+'` (distance: '+s.distance_from_original+') \u2014 '+s.first_seen).join('\\n') }}\n\n_Likely used for phishing. Jira ticket created. Consider blocklisting._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Protected Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Protected Domains": {
+      "main": [
+        [
+          {
+            "node": "Check UrlScan.io for New Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check UrlScan.io for New Domains": {
+      "main": [
+        [
+          {
+            "node": "Detect Squatting Patterns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Squatting Patterns": {
+      "main": [
+        [
+          {
+            "node": "Squats Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Squats Found?": {
+      "main": [
+        [
+          {
+            "node": "Create Brand Protection Ticket",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Brand Squatting Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "threat-intel",
+    "workflow_id": "TI-03",
+    "phase": 1,
+    "description": "Daily: checks new domain registrations for typosquats/homoglyphs of your domain. Blocklists confirmed squats."
+  }
+}

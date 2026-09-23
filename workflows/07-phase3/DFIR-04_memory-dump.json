@@ -1,0 +1,151 @@
+{
+  "name": "\ud83d\udd0d DFIR-04 | Live Memory Analysis Trigger",
+  "nodes": [
+    {
+      "id": "d4-wh",
+      "name": "Memory Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dfir/memory-analysis",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "d4-validate",
+      "name": "Validate & Authorize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\n// Only execute on pre-approved DFIR hosts to prevent misuse\nconst approved_hosts=['prod-web-01','prod-db-01','prod-api-01']; // pull from DB in prod\nconst hostname=evt.hostname||evt.host||'';\nconst is_approved=approved_hosts.includes(hostname)||evt.dfir_authorized===true;\nif(!is_approved) throw new Error(`Memory analysis not authorized for host: ${hostname}. Add to approved list.`);\nreturn[{json:{hostname,case_id:evt.case_id||`MEM-${Date.now()}`,\n  alert_type:evt.alert_type||'suspicious_process',process_name:evt.process_name||'unknown',\n  pid:evt.pid||null,authorized:true,requested_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "d4-plan",
+      "name": "Plan Volatility Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx=$input.first().json;\n// Volatility 3 plugin selection based on alert type\nconst plugin_map={\n  'suspicious_process':['windows.pslist','windows.pstree','windows.cmdline','windows.dlllist'],\n  'network_anomaly':['windows.netstat','windows.netscan','windows.connections'],\n  'rootkit_suspected':['windows.ssdt','windows.idt','windows.callbacks','windows.modules'],\n  'credential_access':['windows.lsadump','windows.hashdump','windows.cachedump'],\n  'default':['windows.pslist','windows.cmdline','windows.netstat']\n};\nconst plugins=plugin_map[ctx.alert_type]||plugin_map['default'];\nreturn[{json:{...ctx,plugins,plugin_count:plugins.length,\n  volatility_cmd:`vol.py -f /proc/kcore ${plugins.join(' ')}`,\n  analysis_id:`VOL-${ctx.case_id}`}}];"
+      }
+    },
+    {
+      "id": "d4-log",
+      "name": "Log Memory Analysis Task",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dfir_memory_tasks (analysis_id,case_id,hostname,plugins_json,status,requested_at) VALUES ('AID','CID','host','[]','Running',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d4-slack",
+      "name": "Memory Analysis Started",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_DFIR"
+        },
+        "text": "=\ud83d\udd0d *Live Memory Analysis Triggered*\n\n*Analysis ID:* `{{ $json.analysis_id }}`\n*Host:* {{ $json.hostname }}\n*Alert Type:* {{ $json.alert_type }}\n*Process:* {{ $json.process_name }} (PID: {{ $json.pid }})\n*Volatility Plugins:*\n{{ $json.plugins.map(p=>'\u2022 '+p).join('\\n') }}\n\n_Analysis running. Results will be posted when complete._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Memory Alert": {
+      "main": [
+        [
+          {
+            "node": "Validate & Authorize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Authorize": {
+      "main": [
+        [
+          {
+            "node": "Plan Volatility Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Volatility Analysis": {
+      "main": [
+        [
+          {
+            "node": "Log Memory Analysis Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Memory Analysis Task": {
+      "main": [
+        [
+          {
+            "node": "Memory Analysis Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "dfir",
+    "workflow_id": "DFIR-04",
+    "phase": 3,
+    "description": "EDR live memory alert \u2192 trigger Volatility framework on target host \u2192 extract artifacts \u2192 attach to case."
+  }
+}

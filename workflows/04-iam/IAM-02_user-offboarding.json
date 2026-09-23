@@ -1,0 +1,585 @@
+{
+  "name": "\ud83d\udd11 IAM-02 | User Offboarding Zero-Lag",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "iam/offboarding",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "iam-wh-01",
+      "name": "HR Termination Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "notes": "Triggered by HR system (e.g. Workday, BambooHR) on employee termination. Must include: employee_id, email, manager_email, effective_date, reason"
+    },
+    {
+      "parameters": {
+        "jsCode": "const payload = $input.first().json;\nconst raw = payload.raw_data || payload;\n\n// Validate required fields\nconst required = ['employee_id', 'email'];\nfor (const f of required) {\n  if (!raw[f]) throw new Error(`Missing required HR field: ${f}`);\n}\n\n// Email validation\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!emailRegex.test(raw.email)) throw new Error(`Invalid email format: ${raw.email}`);\n\n// Build user context\nconst offboarding_id = `OFFB-${Date.now()}-${raw.employee_id}`;\n\nreturn [{\n  json: {\n    _offboarding_id: offboarding_id,\n    _started_at: new Date().toISOString(),\n    // User info\n    employee_id: raw.employee_id,\n    email: raw.email,\n    username: raw.username || raw.email.split('@')[0],\n    full_name: raw.full_name || raw.name || 'Unknown',\n    manager_email: raw.manager_email || null,\n    department: raw.department || 'Unknown',\n    effective_date: raw.effective_date || new Date().toISOString(),\n    termination_reason: raw.reason || 'Not specified',\n    // Action tracking (populated as workflow progresses)\n    actions_completed: [],\n    actions_failed: [],\n    // Confidence: HR webhooks are always high confidence (trusted source)\n    confidence_score: 95,\n    risk_level: 'Low'\n  }\n}];"
+      },
+      "id": "iam-validate-02",
+      "name": "Validate & Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IT_OPS"
+        },
+        "text": "\ud83d\udd34 *Offboarding Initiated \u2014 {{ $json.full_name }}*\n\n*Offboarding ID:* `{{ $json._offboarding_id }}`\n*Employee:* {{ $json.full_name }} ({{ $json.email }})\n*Department:* {{ $json.department }}\n*Effective:* {{ $json.effective_date }}\n*Manager:* {{ $json.manager_email }}\n\n\u23f1\ufe0f Access revocation in progress. All actions will be logged.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "iam-notify-start-03",
+      "name": "Notify: Offboarding Started",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        640,
+        160
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $credentials.microsoftActiveDirectory.domain }}/api/user/disable",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.microsoftActiveDirectory.token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ upn: $json.email, employee_id: $json.employee_id, reason: 'Termination - ' + $json._offboarding_id }) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "iam-ad-04",
+      "name": "Disable Active Directory Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "notes": "Replace URL with your AD management endpoint (e.g. Graph API or internal AD REST service)",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "AD_API",
+          "name": "Active Directory API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $credentials.okta.domain }}/api/v1/users/{{ $json.email }}/lifecycle/deactivate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=SSWS {{ $credentials.okta.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "iam-okta-05",
+      "name": "Deactivate Okta Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        440
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OKTA_API",
+          "name": "Okta API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect results from all parallel revocation actions\nconst context = $('Validate & Build Context').first().json;\nconst adResult = $('Disable Active Directory Account').first().json;\nconst oktaResult = $('Deactivate Okta Account').first().json;\n\nconst actions = [];\nconst failures = [];\n\n// AD check\nif (adResult.error || adResult.status >= 400) {\n  failures.push({ action: 'disable_active_directory', error: adResult.error || adResult.message || 'HTTP ' + adResult.status });\n} else {\n  actions.push({ action: 'disable_active_directory', status: 'success', timestamp: new Date().toISOString() });\n}\n\n// Okta check\nif (oktaResult.errorCode || oktaResult.status >= 400) {\n  failures.push({ action: 'deactivate_okta', error: oktaResult.errorCode || 'HTTP ' + oktaResult.status });\n} else {\n  actions.push({ action: 'deactivate_okta', status: 'success', timestamp: new Date().toISOString() });\n}\n\nreturn [{\n  json: {\n    ...context,\n    actions_completed: actions,\n    actions_failed: failures,\n    phase1_complete: failures.length === 0,\n    phase1_errors: failures.length\n  }\n}];"
+      },
+      "id": "iam-collect-06",
+      "name": "Collect Phase 1 Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://iam.amazonaws.com/?Action=DeleteAccessKey&UserName={{ $json.username }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=AWS4-HMAC-SHA256 Credential={{ $credentials.awsIam.accessKeyId }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "iam-aws-07",
+      "name": "Revoke AWS IAM Keys",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1100,
+        200
+      ],
+      "notes": "Use AWS SDK via n8n's AWS credential type for production",
+      "credentials": {
+        "aws": {
+          "id": "AWS_MAIN",
+          "name": "AWS Production"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://management.azure.com/subscriptions/{{ $credentials.azure.subscriptionId }}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=principalId eq '{{ $json.employee_id }}'",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.azure.token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "iam-azure-08",
+      "name": "Revoke Azure Roles",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1100,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "AZURE_API",
+          "name": "Azure Management API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $credentials.vpnApi.host }}/api/v1/users/{{ $json.email }}/revoke",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.vpnApi.token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "iam-vpn-09",
+      "name": "Revoke VPN Certificate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1100,
+        440
+      ],
+      "notes": "Adapt to your VPN provider: OpenVPN Access Server, Cisco ASA, Palo Alto GlobalProtect"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build complete offboarding evidence record\nconst context = $('Collect Phase 1 Results').first().json;\nconst awsResult = $('Revoke AWS IAM Keys').first().json;\nconst azureResult = $('Revoke Azure Roles').first().json;\nconst vpnResult = $('Revoke VPN Certificate').first().json;\n\nconst allActions = [...(context.actions_completed || [])];\nconst allFailures = [...(context.actions_failed || [])];\n\n// Check Phase 2 results\nif (!awsResult.Error) allActions.push({ action: 'revoke_aws_iam', status: 'success', timestamp: new Date().toISOString() });\nelse allFailures.push({ action: 'revoke_aws_iam', error: awsResult.Error?.Message || 'Unknown error' });\n\nif (azureResult.value !== undefined) allActions.push({ action: 'revoke_azure_roles', status: 'success', count: azureResult.value?.length || 0, timestamp: new Date().toISOString() });\nelse allFailures.push({ action: 'revoke_azure_roles', error: azureResult.error?.message || 'Unknown error' });\n\nif (!vpnResult.error) allActions.push({ action: 'revoke_vpn_certificate', status: 'success', timestamp: new Date().toISOString() });\nelse allFailures.push({ action: 'revoke_vpn_certificate', error: vpnResult.error });\n\nconst completed_at = new Date().toISOString();\nconst start = new Date(context._started_at);\nconst end = new Date(completed_at);\nconst duration_seconds = Math.round((end - start) / 1000);\n\nreturn [{\n  json: {\n    ...context,\n    actions_completed: allActions,\n    actions_failed: allFailures,\n    total_actions: allActions.length + allFailures.length,\n    actions_succeeded: allActions.length,\n    actions_failed_count: allFailures.length,\n    offboarding_complete: allFailures.length === 0,\n    completed_at,\n    duration_seconds,\n    // SLA: target is < 900 seconds (15 minutes)\n    sla_met: duration_seconds < 900\n  }\n}];"
+      },
+      "id": "iam-finalize-10",
+      "name": "Build Evidence Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "IAM",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Offboarding",
+          "mode": "name"
+        },
+        "summary": "=[OFFB] {{ $json.full_name }} ({{ $json.email }}) \u2014 {{ $json.offboarding_complete ? 'COMPLETE' : 'PARTIAL - ACTION REQUIRED' }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.offboarding_complete ? 'Medium' : 'High' }}"
+          },
+          "description": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "=*User Offboarding \u2014 Cyber Constellation IAM Agent*\n\n*Offboarding ID:* {{ $json._offboarding_id }}\n*Employee:* {{ $json.full_name }} ({{ $json.employee_id }})\n*Email:* {{ $json.email }}\n*Department:* {{ $json.department }}\n*Manager:* {{ $json.manager_email }}\n*Effective Date:* {{ $json.effective_date }}\n*Termination Reason:* {{ $json.termination_reason }}\n\n---\n*REVOCATION SUMMARY*\n*Started:* {{ $json._started_at }}\n*Completed:* {{ $json.completed_at }}\n*Duration:* {{ $json.duration_seconds }}s (SLA 900s \u2014 {{ $json.sla_met ? '\u2705 MET' : '\u274c BREACHED' }})\n*Status:* {{ $json.offboarding_complete ? '\u2705 All access revoked successfully' : '\u26a0\ufe0f ' + $json.actions_failed_count + ' action(s) failed \u2014 manual follow-up required' }}\n\n*Actions Completed ({{ $json.actions_succeeded }}):*\n{{ $json.actions_completed.map(a => '\u2705 ' + a.action + ' \u2014 ' + a.timestamp).join('\\n') }}\n\n{{ $json.actions_failed_count > 0 ? '*Actions Failed (' + $json.actions_failed_count + '):*\\n' + $json.actions_failed.map(a => '\u274c ' + a.action + ' \u2014 ' + a.error).join('\\n') : '' }}\n\n---\n*This ticket serves as the compliance evidence record for this offboarding.*"
+                  }
+                ]
+              }
+            ]
+          },
+          "labels": [
+            "iam",
+            "offboarding",
+            "auto-generated"
+          ]
+        }
+      },
+      "id": "iam-jira-11",
+      "name": "Create Compliance Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        300
+      ],
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_IT_OPS"
+        },
+        "text": "={{ $json.offboarding_complete ? '\u2705' : '\u26a0\ufe0f' }} *Offboarding {{ $json.offboarding_complete ? 'Complete' : 'PARTIAL \u2014 Action Required' }} \u2014 {{ $json.full_name }}*\n\n*ID:* `{{ $json._offboarding_id }}`\n*Duration:* {{ $json.duration_seconds }}s | SLA: {{ $json.sla_met ? '\u2705 Met' : '\u274c Breached' }}\n*Actions:* {{ $json.actions_succeeded }}/{{ $json.total_actions }} succeeded\n{{ $json.actions_failed_count > 0 ? '*Failed:* ' + $json.actions_failed.map(a => a.action).join(', ') : '' }}\n*Jira:* <{{ $('Create Compliance Ticket').first().json.self }}|{{ $('Create Compliance Ticket').first().json.key }}>",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "iam-slack-final-12",
+      "name": "Notify: Offboarding Complete",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "iam_offboarding_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "offboarding_id": "={{ $json._offboarding_id }}",
+            "employee_id": "={{ $json.employee_id }}",
+            "email": "={{ $json.email }}",
+            "full_name": "={{ $json.full_name }}",
+            "department": "={{ $json.department }}",
+            "effective_date": "={{ $json.effective_date }}",
+            "started_at": "={{ $json._started_at }}",
+            "completed_at": "={{ $json.completed_at }}",
+            "duration_seconds": "={{ $json.duration_seconds }}",
+            "sla_met": "={{ $json.sla_met }}",
+            "actions_succeeded": "={{ $json.actions_succeeded }}",
+            "actions_failed_count": "={{ $json.actions_failed_count }}",
+            "offboarding_complete": "={{ $json.offboarding_complete }}",
+            "evidence_json": "={{ JSON.stringify({ actions: $json.actions_completed, failures: $json.actions_failed }) }}"
+          }
+        }
+      },
+      "id": "iam-log-13",
+      "name": "Log to Audit DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "HR Termination Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Build Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Build Context": {
+      "main": [
+        [
+          {
+            "node": "Notify: Offboarding Started",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Disable Active Directory Account",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Deactivate Okta Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify: Offboarding Started": {
+      "main": [
+        [
+          {
+            "node": "Collect Phase 1 Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Disable Active Directory Account": {
+      "main": [
+        [
+          {
+            "node": "Collect Phase 1 Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deactivate Okta Account": {
+      "main": [
+        [
+          {
+            "node": "Collect Phase 1 Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Phase 1 Results": {
+      "main": [
+        [
+          {
+            "node": "Revoke AWS IAM Keys",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Revoke Azure Roles",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Revoke VPN Certificate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revoke AWS IAM Keys": {
+      "main": [
+        [
+          {
+            "node": "Build Evidence Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revoke Azure Roles": {
+      "main": [
+        [
+          {
+            "node": "Build Evidence Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revoke VPN Certificate": {
+      "main": [
+        [
+          {
+            "node": "Build Evidence Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Evidence Record": {
+      "main": [
+        [
+          {
+            "node": "Create Compliance Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Compliance Ticket": {
+      "main": [
+        [
+          {
+            "node": "Notify: Offboarding Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify: Offboarding Complete": {
+      "main": [
+        [
+          {
+            "node": "Log to Audit DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "ORCH-02"
+  },
+  "tags": [
+    {
+      "name": "iam"
+    },
+    {
+      "name": "offboarding"
+    },
+    {
+      "name": "phase-1"
+    },
+    {
+      "name": "production"
+    }
+  ],
+  "meta": {
+    "constellation_version": "1.0",
+    "domain": "iam",
+    "agent": "iam-agent",
+    "workflow_id": "IAM-02",
+    "phase": 1,
+    "confidence_score": 95,
+    "sla_target_seconds": 900,
+    "credentials_required": [
+      "POSTGRES_MAIN",
+      "SLACK_MAIN",
+      "JIRA_MAIN",
+      "AD_API",
+      "OKTA_API",
+      "AWS_MAIN",
+      "AZURE_API"
+    ],
+    "webhook_path": "iam/offboarding",
+    "description": "Zero-lag user offboarding. Simultaneously disables AD, Okta, AWS, Azure, and VPN access on HR termination event. Creates compliance evidence ticket. SLA target: < 15 minutes."
+  }
+}

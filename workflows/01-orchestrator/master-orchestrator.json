@@ -1,0 +1,210 @@
+{
+  "name": "🌐 Master Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "constellation/event",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "orch-webhook-01",
+      "name": "Event Intake Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "All agents and external systems POST events here. Payload must include: source, event_type, severity, timestamp, raw_data"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── GLOBAL ENRICHMENT ────────────────────────────────────────\n// Normalize all incoming events to the Constellation standard schema\n\nconst raw = $input.first().json;\nconst now = new Date().toISOString();\n\n// Validate required fields\nconst required = ['source', 'event_type', 'severity', 'timestamp', 'raw_data'];\nconst missing = required.filter(f => !raw[f]);\nif (missing.length > 0) {\n  throw new Error(`Missing required fields: ${missing.join(', ')}`);\n}\n\n// Normalize severity to 1–5 scale\nconst severityMap = {\n  critical: 5, high: 4, medium: 3, low: 2, info: 1,\n  CRITICAL: 5, HIGH: 4, MEDIUM: 3, LOW: 2, INFO: 1,\n  '5': 5, '4': 4, '3': 3, '2': 2, '1': 1\n};\nconst severityScore = severityMap[raw.severity] || 3;\n\n// Route mapping: event_type → target agent webhook path\nconst routeMap = {\n  // Blue Team\n  siem_alert: 'blue-team/siem-enrichment',\n  ioc_feed: 'blue-team/ioc-ingestion',\n  threat_hunt: 'blue-team/threat-hunt',\n  // IAM\n  user_termination: 'iam/offboarding',\n  login_anomaly: 'iam/anomaly-detector',\n  mfa_gap: 'iam/mfa-enforcer',\n  pam_review: 'iam/pam-review',\n  // GRC\n  audit_trigger: 'grc/audit-scheduler',\n  risk_submission: 'grc/risk-register',\n  policy_publish: 'grc/policy-tracker',\n  vendor_onboard: 'grc/vendor-risk',\n  data_breach: 'grc/gdpr-breach',\n  // Vuln Mgmt\n  scanner_result: 'vuln-mgmt/aggregator',\n  patch_release: 'vuln-mgmt/patch-tuesday',\n  zero_day: 'vuln-mgmt/zeroday-warroom',\n  sla_breach: 'vuln-mgmt/sla-alerter',\n  // Cloud\n  cloud_finding: 'cloud/cspm-manager',\n  image_push: 'cloud/container-gate',\n  iac_commit: 'cloud/iac-gate',\n  // Network\n  dns_anomaly: 'network/dns-anomaly',\n  credential_breach: 'network/dark-web-monitor',\n  vpn_anomaly: 'network/vpn-anomaly',\n  // Endpoint\n  edr_alert: 'endpoint/edr-enrichment',\n  malware_hash: 'endpoint/hash-blocker',\n  usb_event: 'endpoint/usb-policy',\n  // Threat Intel\n  intel_brief: 'threat-intel/daily-brief',\n  ioc_malware: 'threat-intel/ioc-processor',\n  brand_alert: 'threat-intel/brand-monitor',\n  // DevSecOps\n  code_push: 'devsecops/secret-scanner',\n  pr_created: 'devsecops/sast-dast-gate',\n  dep_vuln: 'devsecops/dep-sla-monitor',\n  // DFIR\n  incident_declared: 'dfir/evidence-logger',\n  // Awareness\n  phish_result: 'awareness/phishing-tracker',\n  training_gap: 'awareness/training-compliance',\n};\n\nconst targetAgent = routeMap[raw.event_type];\nif (!targetAgent) {\n  return [{ json: { ...raw, _routing_error: true, _error: `Unknown event_type: ${raw.event_type}`, _received_at: now }}];\n}\n\n// Build normalized Constellation Event Object\nreturn [{\n  json: {\n    // Routing\n    _constellation_event_id: `CE-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`,\n    _received_at: now,\n    _target_agent: targetAgent,\n    _routing_error: false,\n    // Source data\n    source: raw.source,\n    event_type: raw.event_type,\n    severity: raw.severity,\n    severity_score: severityScore,\n    timestamp: raw.timestamp,\n    raw_data: raw.raw_data,\n    // Optional enrichment fields (populated by subsequent nodes)\n    asset_context: raw.asset_context || null,\n    user_context: raw.user_context || null,\n    geo_context: raw.geo_context || null,\n    confidence_score: null,\n    risk_level: null,\n    // Pass-through any custom fields\n    ...(raw.metadata && { metadata: raw.metadata }),\n  }\n}];"
+      },
+      "id": "orch-normalize-02",
+      "name": "Normalize & Route Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "route-error-check",
+              "leftValue": "={{ $json._routing_error }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "orch-routecheck-03",
+      "name": "Routing Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── GLOBAL CONFIDENCE ENGINE ─────────────────────────────────\n// Computes a preliminary confidence score BEFORE routing to agents.\n// Agents will refine this with domain-specific signals.\n\nconst event = $input.first().json;\n\n// Signal 1: Source reliability (known trusted sources score higher)\nconst trustedSources = ['wazuh', 'splunk', 'crowdstrike', 'qualys', 'nessus',\n  'github', 'okta', 'active_directory', 'aws_securityhub', 'azure_defender'];\nconst sourceScore = trustedSources.includes(event.source?.toLowerCase()) ? 90 : 65;\n\n// Signal 2: Data completeness (how many raw_data fields are populated)\nconst rawDataKeys = Object.keys(event.raw_data || {});\nconst completenessScore = Math.min(100, (rawDataKeys.length / 5) * 100);\n\n// Signal 3: Severity contributes to urgency, not confidence\n// We use a base confidence that agents will refine\nconst baseConfidence = Math.round(\n  (sourceScore * 0.6) + (completenessScore * 0.4)\n);\n\n// Apply risk level based on severity score\nlet riskLevel = 'Low';\nif (event.severity_score >= 5) riskLevel = 'Critical';\nelse if (event.severity_score >= 4) riskLevel = 'High';\nelse if (event.severity_score >= 3) riskLevel = 'Medium';\n\n// Safety gate: Critical risk always requires human review\nconst requiresHumanGate = (riskLevel === 'Critical' || riskLevel === 'High');\n\nreturn [{\n  json: {\n    ...event,\n    confidence_score: baseConfidence,\n    risk_level: riskLevel,\n    requires_human_gate: requiresHumanGate,\n    _confidence_breakdown: {\n      source_reliability: sourceScore,\n      data_completeness: Math.round(completenessScore),\n      base_confidence: baseConfidence\n    }\n  }\n}];"
+      },
+      "id": "orch-confidence-04",
+      "name": "Compute Base Confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 380]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "id": "confidence-gate",
+              "leftValue": "={{ $json.confidence_score }}",
+              "rightValue": 40,
+              "operator": { "type": "number", "operation": "gte" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "orch-confgate-05",
+      "name": "Confidence ≥ 40?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 380]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://n8n:5678/webhook/' + $json._target_agent }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "X-Constellation-Event-ID", "value": "={{ $json._constellation_event_id }}" },
+            { "name": "X-Confidence-Score", "value": "={{ $json.confidence_score }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [] },
+        "options": { "timeout": 30000 },
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "orch-route-06",
+      "name": "Route to Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": { "value": "public" },
+        "table": { "value": "constellation_events" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ $json._constellation_event_id }}",
+            "received_at": "={{ $json._received_at }}",
+            "source": "={{ $json.source }}",
+            "event_type": "={{ $json.event_type }}",
+            "severity": "={{ $json.severity }}",
+            "severity_score": "={{ $json.severity_score }}",
+            "confidence_score": "={{ $json.confidence_score }}",
+            "risk_level": "={{ $json.risk_level }}",
+            "target_agent": "={{ $json._target_agent }}",
+            "routing_error": "={{ $json._routing_error }}",
+            "raw_payload": "={{ JSON.stringify($json.raw_data) }}"
+          }
+        }
+      },
+      "id": "orch-log-07",
+      "name": "Log to PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1560, 300],
+      "credentials": { "postgres": { "id": "POSTGRES_MAIN", "name": "Constellation DB" } }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "C_SOC_TRIAGE" },
+        "text": "⚠️ *Low Confidence Event — Human Review Required*\n\n*Event ID:* `{{ $json._constellation_event_id }}`\n*Type:* `{{ $json.event_type }}`\n*Source:* `{{ $json.source }}`\n*Confidence:* `{{ $json.confidence_score }}%` (below 40% threshold)\n*Severity:* `{{ $json.severity }}`\n\nThis event did not meet the minimum confidence threshold for automated routing. Manual triage required.",
+        "otherOptions": { "mrkdwn": true }
+      },
+      "id": "orch-lowconf-08",
+      "name": "Alert: Low Confidence",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1340, 500],
+      "credentials": { "slackApi": { "id": "SLACK_MAIN", "name": "Constellation Slack" } }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "C_SOC_ERRORS" },
+        "text": "🚨 *Routing Error — Unknown Event Type*\n\n*Received:* `{{ $json.event_type }}`\n*Source:* `{{ $json.source }}`\n*Time:* `{{ $json._received_at }}`\n\nNo agent registered for this event type. Add it to the route map in `master-orchestrator.json`.",
+        "otherOptions": { "mrkdwn": true }
+      },
+      "id": "orch-routeerr-09",
+      "name": "Alert: Routing Error",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [900, 160],
+      "credentials": { "slackApi": { "id": "SLACK_MAIN", "name": "Constellation Slack" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'accepted', event_id: $json._constellation_event_id, confidence: $json.confidence_score, routed_to: $json._target_agent }) }}"
+      },
+      "id": "orch-respond-10",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Event Intake Webhook": { "main": [[{ "node": "Normalize & Route Event", "type": "main", "index": 0 }]] },
+    "Normalize & Route Event": { "main": [[{ "node": "Routing Error?", "type": "main", "index": 0 }]] },
+    "Routing Error?": {
+      "main": [
+        [{ "node": "Alert: Routing Error", "type": "main", "index": 0 }],
+        [{ "node": "Compute Base Confidence", "type": "main", "index": 0 }]
+      ]
+    },
+    "Compute Base Confidence": { "main": [[{ "node": "Confidence ≥ 40?", "type": "main", "index": 0 }]] },
+    "Confidence ≥ 40?": {
+      "main": [
+        [{ "node": "Route to Agent", "type": "main", "index": 0 }],
+        [{ "node": "Alert: Low Confidence", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route to Agent": { "main": [[{ "node": "Log to PostgreSQL", "type": "main", "index": 0 }]] },
+    "Log to PostgreSQL": { "main": [[{ "node": "Respond 200 OK", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-handler"
+  },
+  "tags": [{ "name": "orchestrator" }, { "name": "phase-1" }, { "name": "production" }],
+  "meta": {
+    "constellation_version": "1.0",
+    "domain": "orchestrator",
+    "agent": "master-orchestrator",
+    "phase": 1,
+    "confidence_threshold": 40,
+    "description": "Central routing hub. Normalizes all incoming events, computes base confidence, and routes to the correct agent webhook. Logs every event to PostgreSQL.",
+    "credentials_required": ["POSTGRES_MAIN", "SLACK_MAIN"],
+    "webhook_path": "constellation/event"
+  }
+}

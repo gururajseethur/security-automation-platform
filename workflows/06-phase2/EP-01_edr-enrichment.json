@@ -1,0 +1,253 @@
+{
+  "name": "\ud83d\udcbb EP-01 | EDR Alert Enrichment & Auto-Ticket",
+  "nodes": [
+    {
+      "id": "e1-wh",
+      "name": "EDR Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "endpoint/edr-alert",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "e1-extract",
+      "name": "Extract EDR Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst raw=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{alert_id:raw.alert_id||raw.id||`EDR-${Date.now()}`,hostname:raw.hostname||raw.device_name||'unknown',\n  username:raw.username||raw.user||'unknown',process:raw.filename||raw.process_name||'unknown',\n  cmdline:raw.cmdline||raw.command_line||'',sha256:raw.sha256||raw.file_hash||null,\n  severity:raw.severity||raw.alert_severity||'Medium',technique:raw.technique||raw.tactic||'Unknown',\n  timestamp:raw.timestamp||new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "e1-vt",
+      "name": "VirusTotal Hash Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        200
+      ],
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/files/{{ $json.sha256 }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-apikey",
+              "value": "={{ $credentials.virustotalApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "VT_API",
+          "name": "VirusTotal API"
+        }
+      }
+    },
+    {
+      "id": "e1-asset",
+      "name": "CMDB Asset Lookup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT asset_id,criticality,owner_team,environment FROM cmdb_assets WHERE hostname='placeholder';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "e1-enrich",
+      "name": "Build Enriched Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst alert=$('Extract EDR Fields').first().json;\nconst vt=$('VirusTotal Hash Check').first().json;\nconst asset=$('CMDB Asset Lookup').all()[0]?.json||{criticality:'unknown'};\nconst vt_malicious=vt.data?.attributes?.last_analysis_stats?.malicious||0;\nconst vt_total=Object.values(vt.data?.attributes?.last_analysis_stats||{}).reduce((a,b)=>a+b,0)||1;\nconst vt_score=Math.round((vt_malicious/vt_total)*100);\nconst is_malicious=vt_score>=20;\nconst priority=is_malicious&&asset.criticality==='critical'?'Highest':is_malicious?'High':alert.severity==='Critical'?'High':'Medium';\nreturn[{json:{...alert,vt_score,vt_malicious,is_malicious,asset_criticality:asset.criticality,owner_team:asset.owner_team,priority}}];"
+      }
+    },
+    {
+      "id": "e1-jira",
+      "name": "Create EDR Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "SOC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[EDR-{{ $json.severity.toUpperCase() }}] {{ $json.hostname }} | {{ $json.process }} | VT: {{ $json.vt_score }}%",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.priority }}"
+          },
+          "labels": [
+            "edr",
+            "endpoint",
+            "auto-ticket"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "e1-slack",
+      "name": "EDR Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_ALERTS"
+        },
+        "text": "=\ud83d\udcbb *EDR Alert \u2014 {{ $json.severity }}*\n\n*Host:* `{{ $json.hostname }}` ({{ $json.asset_criticality }})\n*User:* {{ $json.username }}\n*Process:* `{{ $json.process }}`\n*VT Score:* {{ $json.vt_score }}% ({{ $json.vt_malicious }} engines)\n*Team:* {{ $json.owner_team }}\n*Jira:* {{ $('Create EDR Jira').first().json.key }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "EDR Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract EDR Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract EDR Fields": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Hash Check",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "CMDB Asset Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Hash Check": {
+      "main": [
+        [
+          {
+            "node": "Build Enriched Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CMDB Asset Lookup": {
+      "main": [
+        [
+          {
+            "node": "Build Enriched Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Enriched Context": {
+      "main": [
+        [
+          {
+            "node": "Create EDR Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create EDR Jira": {
+      "main": [
+        [
+          {
+            "node": "EDR Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "endpoint",
+    "workflow_id": "EP-01",
+    "phase": 2,
+    "description": "CrowdStrike/SentinelOne event \u2192 enrich with host context + hash VT lookup \u2192 create Jira with full forensic context."
+  }
+}

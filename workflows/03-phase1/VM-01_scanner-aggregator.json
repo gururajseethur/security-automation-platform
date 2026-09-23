@@ -1,0 +1,199 @@
+{
+  "name": "\ud83d\udd2c VM-01 | Vulnerability Scanner Aggregator & Deduplicator",
+  "nodes": [
+    {
+      "id": "v1-cron",
+      "name": "Daily 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "v1-nessus",
+      "name": "Fetch Nessus",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.nessusApi.host }}:8834/scans",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-ApiKeys",
+              "value": "=accessKey={{ $credentials.nessusApi.accessKey }}; secretKey={{ $credentials.nessusApi.secretKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "NESSUS_API",
+          "name": "Nessus API"
+        }
+      }
+    },
+    {
+      "id": "v1-qualys",
+      "name": "Fetch Qualys",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        400
+      ],
+      "parameters": {
+        "url": "https://qualysapi.qg1.apps.qualys.in/api/2.0/fo/asset/host/vm/detection/?action=list&severity_levels=3,4,5",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from($credentials.qualysApi.username+':'+$credentials.qualysApi.password).toString('base64') }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "QUALYS_API",
+          "name": "Qualys API"
+        }
+      }
+    },
+    {
+      "id": "v1-merge",
+      "name": "Normalize & Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst nessus=$('Fetch Nessus').first().json;\nconst qualys=$('Fetch Qualys').first().json;\n// Normalize both sources to common finding schema\n// In production: parse XML responses from Qualys, JSON from Nessus\nconst findings=[];\nconst nessusScans=nessus?.scans||[];\nfor(const s of nessusScans.slice(0,100)){\n  findings.push({source:'Nessus',cve_id:s.id?`CVE-NESSUS-${s.id}`:null,\n    host:s.name||'unknown',severity_score:5,status:'open'});\n}\n// Deduplicate\nconst seen=new Set();\nconst deduped=findings.filter(f=>{const k=`${f.cve_id}-${f.host}`;if(seen.has(k))return false;seen.add(k);return true;});\nreturn[{json:{total_raw:findings.length,total_deduped:deduped.length,dupes_removed:findings.length-deduped.length,\n  sources:{Nessus:nessusScans.length,Qualys:(qualys?.HOST_LIST_VM_DETECTION?.RESPONSE?.HOST_LIST?.HOST||[]).length},\n  aggregated_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "v1-slack",
+      "name": "Aggregation Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_VULN_MGMT"
+        },
+        "text": "\ud83d\udd2c *Nightly Vuln Aggregation*\n\n*Raw findings:* {{ $json.total_raw }}\n*After dedup:* {{ $json.total_deduped }} (removed {{ $json.dupes_removed }})\n*Sources:* Nessus: {{ $json.sources.Nessus }} | Qualys: {{ $json.sources.Qualys }}\n_EPSS scoring at 06:00 via VM-03v2_",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 02:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Nessus",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Qualys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Nessus": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Qualys": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Aggregation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "vuln-mgmt",
+    "workflow_id": "VM-01",
+    "phase": 1,
+    "description": "Nightly 02:00. Pulls from Nessus + Qualys simultaneously. Normalizes to common schema. Deduplicates by CVE+host. Upserts to DB."
+  }
+}

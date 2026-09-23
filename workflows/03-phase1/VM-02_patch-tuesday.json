@@ -1,0 +1,191 @@
+{
+  "name": "\ud83d\udd2c VM-02 | Patch Tuesday Automation Pipeline",
+  "nodes": [
+    {
+      "id": "v2-wh",
+      "name": "Patch Release Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vuln-mgmt/patch-release",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "v2-msrc",
+      "name": "Fetch MSRC",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.msrc.microsoft.com/cvrf/v2.0/updates",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "api-key",
+              "value": "={{ $credentials.msrcApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "MSRC_API",
+          "name": "MSRC API"
+        }
+      }
+    },
+    {
+      "id": "v2-parse",
+      "name": "Parse & Prioritize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst msrc=$('Fetch MSRC').first().json;\nconst vulns=msrc?.Vulnerability||msrc?.value||[];\nconst patches=vulns.slice(0,50).map(v=>{\n  const cvss=parseFloat(v.CVSSScoreSets?.[0]?.BaseScore||v.cvssV3?.baseScore||0);\n  const exploited=(v.Notes||[]).some(n=>(n.Value||'').includes('Exploited'));\n  const wormable=(v.Notes||[]).some(n=>(n.Value||'').includes('Wormable'));\n  let priority='P3-Medium',sla=30;\n  if(exploited){priority='P0-Emergency';sla=0;}\n  else if(wormable||cvss>=9){priority='P1-Critical';sla=1;}\n  else if(cvss>=7){priority='P2-High';sla=7;}\n  return{cve:v.CVE||'N/A',title:(v.Title?.Value||v.CVE||''),cvss,exploited,priority,sla_days:sla,\n    due_date:new Date(Date.now()+sla*86400000).toISOString().split('T')[0]};\n});\nconst emergency=patches.filter(p=>p.priority==='P0-Emergency');\nconst critical=patches.filter(p=>p.priority==='P1-Critical');\nreturn[{json:{month:new Date().toLocaleString('en',{month:'long',year:'numeric'}),\n  total:patches.length,emergency:emergency.length,critical:critical.length,\n  emergency_patches:emergency,critical_patches:critical,patches}}];"
+      }
+    },
+    {
+      "id": "v2-jira",
+      "name": "Create Patch Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "PATCH",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[PATCH-TUESDAY] {{ $json.month }} | {{ $json.total }} patches | {{ $json.emergency }} Emergency",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.emergency>0?'Highest':$json.critical>0?'High':'Medium' }}"
+          },
+          "labels": [
+            "patch-tuesday",
+            "microsoft"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "v2-slack",
+      "name": "Patch Tuesday Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_VULN_MGMT"
+        },
+        "text": "\ud83d\udd2c *Patch Tuesday \u2014 {{ $json.month }}*\n\n*Total:* {{ $json.total }}\n{{ $json.emergency>0?'\ud83d\udd34 EMERGENCY (today): '+$json.emergency+'\\n':'' }}{{ $json.critical>0?'\ud83d\udfe0 Critical (24hr): '+$json.critical+'\\n':'' }}\n{{ $json.emergency_patches.slice(0,3).map(p=>'\u2022 '+p.cve+' \u2014 '+p.title+' (EXPLOITED IN WILD)').join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Patch Release Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch MSRC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch MSRC": {
+      "main": [
+        [
+          {
+            "node": "Parse & Prioritize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Prioritize": {
+      "main": [
+        [
+          {
+            "node": "Create Patch Jira",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Patch Jira": {
+      "main": [
+        [
+          {
+            "node": "Patch Tuesday Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "vuln-mgmt",
+    "workflow_id": "VM-02",
+    "phase": 1,
+    "description": "Triggered on Patch Tuesday. Fetches MSRC advisories. Scores: exploited=P0(same day), critical=P1(24h), CVSS>=7=P2(7d)."
+  }
+}

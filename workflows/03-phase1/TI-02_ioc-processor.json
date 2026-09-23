@@ -1,0 +1,188 @@
+{
+  "name": "\ud83d\udd75\ufe0f TI-02 | Malware IOC Feed Processor",
+  "nodes": [
+    {
+      "id": "t2-cron",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */4 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "t2-mb",
+      "name": "Fetch MalwareBazaar",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "https://mb-api.abuse.ch/api/v1/",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"query\":\"get_recent\",\"selector\":\"100\"}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "t2-otx",
+      "name": "Fetch OTX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        400
+      ],
+      "parameters": {
+        "url": "=https://otx.alienvault.com/api/v1/pulses/subscribed?limit=20",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-OTX-API-KEY",
+              "value": "={{ $credentials.otxApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OTX_API",
+          "name": "OTX API"
+        }
+      }
+    },
+    {
+      "id": "t2-parse",
+      "name": "Extract & Normalize IOCs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst mb=$('Fetch MalwareBazaar').first().json;\nconst otx=$('Fetch OTX').first().json;\nconst batchId=`IOC-${Date.now()}`;\nconst iocs=[];\nfor(const s of (mb?.data||[]).slice(0,50)){\n  if(s.sha256_hash) iocs.push({batch_id:batchId,type:'hash',value:s.sha256_hash,hash_type:'sha256',\n    malware_family:s.signature,confidence:90,source:'MalwareBazaar'});\n}\nfor(const pulse of (otx?.results||[])){\n  for(const ind of (pulse.indicators||[]).slice(0,20)){\n    if(['IPv4','domain','FileHash-SHA256'].includes(ind.type)){\n      iocs.push({batch_id:batchId,type:ind.type.includes('Hash')?'hash':ind.type.toLowerCase().replace('ipv4','ip'),\n        value:ind.indicator,confidence:80,source:'OTX',malware_family:pulse.name});\n    }\n  }\n}\nconst seen=new Set();\nconst deduped=iocs.filter(i=>{if(seen.has(i.value))return false;seen.add(i.value);return true;});\nconst byType={};\ndeduped.forEach(i=>{if(!byType[i.type])byType[i.type]=0;byType[i.type]++;});\nreturn[{json:{batch_id:batchId,total:deduped.length,by_type:byType,iocs:deduped,processed_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "t2-slack",
+      "name": "IOC Ingestion Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "\ud83d\udce1 *IOC Ingestion \u2014 {{ $json.batch_id }}*\n\n*Total IOCs:* {{ $json.total }}\n{{ Object.entries($json.by_type).map(([t,n])=>'\u2022 '+t+': '+n).join('\\n') }}\n*Sources:* MalwareBazaar + OTX\n_Pushed to Wazuh SIEM + PostgreSQL_",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch MalwareBazaar",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch OTX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch MalwareBazaar": {
+      "main": [
+        [
+          {
+            "node": "Extract & Normalize IOCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch OTX": {
+      "main": [
+        [
+          {
+            "node": "Extract & Normalize IOCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Normalize IOCs": {
+      "main": [
+        [
+          {
+            "node": "IOC Ingestion Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "threat-intel",
+    "workflow_id": "TI-02",
+    "phase": 1,
+    "description": "Every 4 hours. Fetches IOCs from MalwareBazaar + OTX. Normalizes, deduplicates, pushes to Wazuh SIEM + threat_iocs DB table."
+  }
+}

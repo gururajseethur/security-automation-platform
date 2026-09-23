@@ -1,0 +1,263 @@
+{
+  "name": "\ud83c\udfaf RT-01 | OSINT Recon Pipeline (Authorized Assets Only)",
+  "nodes": [
+    {
+      "id": "r1-cron",
+      "name": "Weekly Monday 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r1-scope",
+      "name": "Fetch In-Scope Assets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT asset_id,hostname,ip_address,domain FROM cmdb_assets WHERE recon_authorized=true AND environment='production';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "r1-build",
+      "name": "Build Recon Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst assets=$input.all().map(i=>i.json);\nconst domains=[...new Set(assets.map(a=>a.domain).filter(Boolean))];\nconst ips=assets.map(a=>a.ip_address).filter(Boolean);\nreturn[{json:{recon_id:`RECON-${Date.now()}`,domains,ips,asset_count:assets.length,started_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "r1-shodan",
+      "name": "Shodan: IP Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "url": "=https://api.shodan.io/shodan/host/{{ $json.ips[0] }}?key={{ $credentials.shodanApi.apiKey }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SHODAN_API",
+          "name": "Shodan API"
+        }
+      }
+    },
+    {
+      "id": "r1-hunter",
+      "name": "Hunter.io: Email Discovery",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "url": "=https://api.hunter.io/v2/domain-search?domain={{ $json.domains[0] }}&api_key={{ $credentials.hunterApi.apiKey }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "r1-report",
+      "name": "Build Attack Surface Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx=$('Build Recon Targets').first().json;\nconst shodan=$('Shodan: IP Lookup').first().json;\nconst hunter=$('Hunter.io: Email Discovery').first().json;\nconst openPorts=shodan.ports||[];\nconst riskySvcs=openPorts.filter(p=>[22,23,3389,1433,3306,5432,6379,27017,9200,445].includes(p));\nconst exposedEmails=(hunter.data?.emails||[]).slice(0,5).map(e=>e.value);\nconst findings=[];\nif(riskySvcs.length>0) findings.push({type:'EXPOSED_PORTS',detail:`Risky ports open: ${riskySvcs.join(', ')}`,severity:'High'});\nif(exposedEmails.length>0) findings.push({type:'EMAIL_EXPOSURE',detail:`${exposedEmails.length} staff emails discoverable`,severity:'Medium'});\nif(shodan.vulns&&Object.keys(shodan.vulns).length>0) findings.push({type:'KNOWN_VULNS',detail:`Shodan reports ${Object.keys(shodan.vulns).length} CVEs on this IP`,severity:'Critical'});\nreturn[{json:{...ctx,open_ports:openPorts,risky_ports:riskySvcs,exposed_emails:exposedEmails,findings,finding_count:findings.length,critical_count:findings.filter(f=>f.severity==='Critical').length}}];"
+      }
+    },
+    {
+      "id": "r1-log",
+      "name": "Log Recon Report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO recon_reports (recon_id,asset_count,finding_count,critical_count,created_at) VALUES ('RID',0,0,0,NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "r1-slack",
+      "name": "Post Attack Surface Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_RED_TEAM"
+        },
+        "text": "\ud83c\udfaf *Weekly Attack Surface Report*\n\n*Recon ID:* `{{ $json.recon_id }}`\n*Assets Scanned:* {{ $json.asset_count }}\n*Findings:* {{ $json.finding_count }} ({{ $json.critical_count }} Critical)\n\n{{ $json.findings.map(f=>(f.severity==='Critical'?'\ud83d\udd34':f.severity==='High'?'\u26a0\ufe0f':'\ud83d\udccb')+' ['+f.severity+'] '+f.detail).join('\\n') }}\n\n_All findings are on authorized in-scope assets only._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Monday 06:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch In-Scope Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch In-Scope Assets": {
+      "main": [
+        [
+          {
+            "node": "Build Recon Targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Recon Targets": {
+      "main": [
+        [
+          {
+            "node": "Shodan: IP Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Hunter.io: Email Discovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shodan: IP Lookup": {
+      "main": [
+        [
+          {
+            "node": "Build Attack Surface Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hunter.io: Email Discovery": {
+      "main": [
+        [
+          {
+            "node": "Build Attack Surface Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Attack Surface Report": {
+      "main": [
+        [
+          {
+            "node": "Log Recon Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Recon Report": {
+      "main": [
+        [
+          {
+            "node": "Post Attack Surface Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "red-team",
+    "workflow_id": "RT-01",
+    "phase": 2,
+    "description": "Scheduled authorized recon on owned assets. Shodan + Subfinder + Hunter.io. Output: attack surface report."
+  }
+}

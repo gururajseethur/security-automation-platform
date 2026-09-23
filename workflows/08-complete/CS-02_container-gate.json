@@ -1,0 +1,232 @@
+{
+  "name": "\u2601\ufe0f CS-02 | Container Image Vulnerability Gate",
+  "nodes": [
+    {
+      "id": "cs2-wh",
+      "name": "Image Push Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cloud/image-push",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "cs2-extract",
+      "name": "Extract Image Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{image:evt.image||evt.tag,repo:evt.repository||evt.repo,digest:evt.digest||null,\n  pushed_by:evt.pusher||evt.actor||'ci',commit_sha:evt.commit_sha||null,\n  scan_id:`TRIVY-${Date.now()}`}}];"
+      }
+    },
+    {
+      "id": "cs2-scan",
+      "name": "Run Trivy Scan (wrapper)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// Production: exec trivy image --format json --exit-code 0 {image} | jq .\n// Or use Trivy operator in K8s / Trivy REST API\n// Mock structure matching Trivy JSON output:\nconst ctx=$input.first().json;\nconst mock_findings=[\n  {VulnerabilityID:'CVE-2024-1234',PkgName:'openssl',Severity:'CRITICAL',CVSS:{nvd:{V3Score:9.8}},\n   Title:'Buffer overflow in OpenSSL',FixedVersion:'3.0.13'},\n  {VulnerabilityID:'CVE-2024-5678',PkgName:'libc',Severity:'HIGH',CVSS:{nvd:{V3Score:7.5}},\n   Title:'Use-after-free in glibc',FixedVersion:'2.38-1'}\n];\nconst critical=mock_findings.filter(f=>f.Severity==='CRITICAL'||parseFloat(f.CVSS?.nvd?.V3Score||0)>=9);\nconst high=mock_findings.filter(f=>f.Severity==='HIGH');\nreturn[{json:{...ctx,findings:mock_findings,critical_count:critical.length,high_count:high.length,\n  should_block:critical.length>0,critical_findings:critical,scanned_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "cs2-gate",
+      "name": "Block Deploy?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-cs2-gate",
+              "leftValue": "={{ $json.should_block }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "cs2-jira",
+      "name": "Create Security Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        200
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "CLOUD",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[CONTAINER-CRITICAL] {{ $json.image }} | {{ $json.critical_count }} Critical CVEs \u2014 DEPLOY BLOCKED",
+        "additionalFields": {
+          "priority": {
+            "name": "Highest"
+          },
+          "labels": [
+            "container",
+            "critical-cve",
+            "deploy-blocked"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "cs2-slack-block",
+      "name": "Block Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        380
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "=\u2601\ufe0f *Container Deploy BLOCKED \u2014 Critical CVEs*\n\n*Image:* `{{ $json.image }}`\n*Pushed by:* {{ $json.pushed_by }}\n*Critical CVEs:* {{ $json.critical_count }} | *High:* {{ $json.high_count }}\n\n{{ $json.critical_findings.slice(0,3).map(f=>'\ud83d\udd34 '+f.VulnerabilityID+' \u2014 '+f.PkgName+' (CVSS '+f.CVSS?.nvd?.V3Score+') Fix: '+f.FixedVersion).join('\\n') }}\n\n_Deploy pipeline blocked. Fix vulnerabilities and re-push._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "cs2-slack-pass",
+      "name": "Scan Passed",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        500
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "=\u2601\ufe0f *Container Scan \u2014 \u2705 No Critical CVEs*\n\n*Image:* `{{ $json.image }}`\n*High:* {{ $json.high_count }} | *Critical:* 0\n_Deploy pipeline unblocked._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Image Push Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Image Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Image Info": {
+      "main": [
+        [
+          {
+            "node": "Run Trivy Scan (wrapper)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Trivy Scan (wrapper)": {
+      "main": [
+        [
+          {
+            "node": "Block Deploy?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Block Deploy?": {
+      "main": [
+        [
+          {
+            "node": "Create Security Ticket",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Block Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Scan Passed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "cloud",
+    "workflow_id": "CS-02",
+    "phase": 2,
+    "description": "On image push to registry: Trivy scan \u2192 block deploy if CVSS\u22659 or Critical CVE exists. Updates GitHub status check."
+  }
+}

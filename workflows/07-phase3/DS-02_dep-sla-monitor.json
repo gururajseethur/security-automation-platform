@@ -1,0 +1,201 @@
+{
+  "name": "\u2699\ufe0f DS-02 | Dependency Vulnerability SLA Monitor",
+  "nodes": [
+    {
+      "id": "ds2-cron",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ds2-snyk",
+      "name": "Fetch Snyk Issues",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://snyk.io/api/v1/org/{{ $credentials.snykApi.orgId }}/issues?severity=critical,high&limit=100",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Token {{ $credentials.snykApi.token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SNYK_API",
+          "name": "Snyk API"
+        }
+      }
+    },
+    {
+      "id": "ds2-score",
+      "name": "Score & SLA Issues",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst issues=$input.first().json?.results?.issues||$input.first().json?.issues||[];\nconst scored=issues.map(i=>{\n  const sev=i.issueData?.severity||i.severity||'low';\n  const cvss=parseFloat(i.issueData?.cvssScore||i.cvssScore||0);\n  const sla_hours=sev==='critical'?24:sev==='high'?72:168;\n  const introduced=new Date(i.introducedDate||i.creationTime||Date.now());\n  const hours_open=Math.floor((Date.now()-introduced)/3600000);\n  const sla_breached=hours_open>sla_hours;\n  return{issue_id:i.id||i.issueId,title:i.issueData?.title||i.title,\n    severity:sev,cvss,package:i.pkgName||i.package,sla_hours,hours_open,sla_breached};\n});\nconst breached=scored.filter(s=>s.sla_breached);\nconst critical_breach=breached.filter(s=>s.severity==='critical');\nreturn[{json:{total:scored.length,breached_count:breached.length,critical_breach:critical_breach.length,\n  should_block_deploy:critical_breach.length>0,issues:scored.slice(0,20),breached_issues:breached}}];"
+      }
+    },
+    {
+      "id": "ds2-jira",
+      "name": "Create SLA Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "APPSEC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[DEP-SLA] {{ $json.breached_count }} dependency vulns past SLA | {{ $json.critical_breach }} Critical",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.critical_breach>0?'Highest':'High' }}"
+          },
+          "labels": [
+            "dependency",
+            "sla",
+            "snyk"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "ds2-slack",
+      "name": "Dependency SLA Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_APPSEC_ALERTS"
+        },
+        "text": "=\u2699\ufe0f *Dependency Vulnerability SLA Report*\n\n*Total Issues:* {{ $json.total }}\n*Past SLA:* {{ $json.breached_count }}\n*Critical Breach:* {{ $json.critical_breach }}\n*Deploy Block:* {{ $json.should_block_deploy?'\ud83d\udd34 BLOCKED':'\u2705 Clear' }}\n\n{{ $json.breached_issues.slice(0,3).map(i=>(i.severity==='critical'?'\ud83d\udd34':'\u26a0\ufe0f')+' '+i.package+' \u2014 '+i.title+' ('+i.hours_open+'h overdue)').join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Snyk Issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Snyk Issues": {
+      "main": [
+        [
+          {
+            "node": "Score & SLA Issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & SLA Issues": {
+      "main": [
+        [
+          {
+            "node": "Create SLA Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create SLA Ticket": {
+      "main": [
+        [
+          {
+            "node": "Dependency SLA Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "devsecops",
+    "workflow_id": "DS-02",
+    "phase": 2,
+    "description": "Daily Snyk/Dependabot scan. Assigns SLA by severity. Blocks deployment pipeline if critical vuln past 24hr SLA."
+  }
+}

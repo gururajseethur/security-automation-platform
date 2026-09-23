@@ -1,0 +1,307 @@
+{
+  "name": "\ud83d\udd75\ufe0f TI-01 | AI-Powered Daily Intel Brief",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "ti-cron-01",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=10&modified_since={{ new Date(Date.now()-86400000).toISOString() }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-OTX-API-KEY",
+              "value": "={{ $credentials.otxApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "ti-otx-02",
+      "name": "Fetch OTX Pulses",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.first.org/data/v1/epss?limit=10&order=-epss",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "ti-epss-03",
+      "name": "Fetch Top EPSS Today",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://services.nvd.nist.gov/rest/json/cves/2.0?pubStartDate={{ new Date(Date.now()-86400000).toISOString().split('T')[0] }}T00:00:00.000&pubEndDate={{ new Date().toISOString().split('T')[0] }}T23:59:59.000&cvssV3Severity=CRITICAL",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apiKey",
+              "value": "={{ $credentials.nvdApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "ti-nvd-04",
+      "name": "Fetch New Critical CVEs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const otx=$('Fetch OTX Pulses').first().json;\nconst epss=$('Fetch Top EPSS Today').first().json;\nconst nvd=$('Fetch New Critical CVEs').first().json;\n\n// Extract top threats from OTX\nconst pulses=(otx.results||[]).slice(0,5).map(p=>({\n  title:p.name,indicators:p.indicators?.length||0,\n  tags:(p.tags||[]).slice(0,3).join(', '),modified:p.modified\n}));\n\n// Top EPSS scores\nconst topEpss=(epss.data||[]).slice(0,5).map(e=>({\n  cve:e.cve,epss:(parseFloat(e.epss)*100).toFixed(1)+'%',percentile:e.percentile\n}));\n\n// New critical CVEs\nconst newCritical=(nvd.vulnerabilities||[]).slice(0,5).map(v=>({\n  id:v.cve.id,cvss:v.cve.metrics?.cvssMetricV31?.[0]?.cvssData?.baseScore||'N/A',\n  desc:v.cve.descriptions?.find(d=>d.lang==='en')?.value?.substring(0,100)+'...'||'No desc'\n}));\n\nreturn[{json:{pulses,topEpss,newCritical,generated_at:new Date().toISOString(),total_pulses:otx.count||0}}];"
+      },
+      "id": "ti-aggregate-05",
+      "name": "Aggregate Intel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({model:'claude-opus-4-5',max_tokens:800,system:'You are a threat intelligence analyst. Write concise, actionable daily security briefs for a SOC team. No fluff. Plain language.',messages:[{role:'user',content:`Write a daily threat brief for today based on this data. Keep it under 400 words. Format: 3 sections: TOP THREATS TODAY, NEW CRITICAL CVEs (flag any with EPSS > 20%), RECOMMENDED ACTIONS. Data:\\n\\n${JSON.stringify($json,null,2)}`}]}) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "ti-ai-06",
+      "name": "AI Brief Writer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        340
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_API",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiResp=$input.first().json;\nconst intel=$('Aggregate Intel').first().json;\nconst brief=aiResp.content?.[0]?.text||'Brief generation failed';\nreturn[{json:{...intel,ai_brief:brief}}];"
+      },
+      "id": "ti-format-07",
+      "name": "Format Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "\ud83d\udce1 *Daily Threat Brief \u2014 {{ new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'}) }}*\n\n{{ $json.ai_brief }}\n\n---\n_Auto-generated by Cyber Constellation TI Agent \u00b7 {{ $json.total_pulses }} OTX pulses analyzed \u00b7 Sources: OTX, NVD, EPSS_",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "ti-slack-08",
+      "name": "Post to #threat-intel",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        340
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch OTX Pulses",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Top EPSS Today",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch New Critical CVEs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch OTX Pulses": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Top EPSS Today": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch New Critical CVEs": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Intel": {
+      "main": [
+        [
+          {
+            "node": "AI Brief Writer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Brief Writer": {
+      "main": [
+        [
+          {
+            "node": "Format Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Brief": {
+      "main": [
+        [
+          {
+            "node": "Post to #threat-intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "threat-intel",
+    "workflow_id": "TI-01",
+    "phase": 1,
+    "description": "Every weekday at 07:00: fetches OTX threat pulses, top EPSS scores, and new critical CVEs. Claude AI synthesizes into a concise daily brief posted to Slack. The ai-models/threat-summarizer is now real."
+  }
+}

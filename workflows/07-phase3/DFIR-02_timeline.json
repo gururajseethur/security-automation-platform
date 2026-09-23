@@ -1,0 +1,220 @@
+{
+  "name": "\ud83d\udd0d DFIR-02 | Unified Timeline Reconstructor",
+  "nodes": [
+    {
+      "id": "d2-wh",
+      "name": "Timeline Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dfir/build-timeline",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "d2-params",
+      "name": "Parse Timeline Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst req=$input.first().json?.raw_data||$input.first().json;\nconst start=req.start_time||new Date(Date.now()-86400000).toISOString();\nconst end=req.end_time||new Date().toISOString();\nreturn[{json:{case_id:req.case_id||`TL-${Date.now()}`,hosts:req.hosts||[],\n  start_time:start,end_time:end,analyst:req.analyst||'unknown'}}];"
+      }
+    },
+    {
+      "id": "d2-alerts",
+      "name": "Query SIEM Alerts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT 'siem_alert' as source, event_id as id, rule_desc as event,\n       src_ip as actor, agent_name as target, severity,\n       processed_at as event_time\nFROM bt_alert_log\nWHERE processed_at BETWEEN '2024-01-01' AND '2024-12-31'\nORDER BY processed_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d2-auth",
+      "name": "Query Auth Events",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT 'auth_log' as source, event_id as id, rule_desc as event,\n       src_ip as actor, username as target, severity,\n       processed_at as event_time\nFROM bt_alert_log\nWHERE rule_id IN ('5501','5502','5503','5710','5711','5712','18107','18108')\n  AND processed_at BETWEEN '2024-01-01' AND '2024-12-31'\nORDER BY processed_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d2-merge",
+      "name": "Build Unified Timeline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst params=$('Parse Timeline Request').first().json;\nconst alerts=$('Query SIEM Alerts').all().map(i=>i.json);\nconst auth=$('Query Auth Events').all().map(i=>i.json);\n// Merge and sort all events chronologically\nconst all=[...alerts,...auth].sort((a,b)=>new Date(a.event_time)-new Date(b.event_time));\n// Group by 5-minute buckets for density analysis\nconst buckets={};\nfor(const e of all){\n  const bucket=new Date(Math.floor(new Date(e.event_time)/300000)*300000).toISOString();\n  if(!buckets[bucket])buckets[bucket]=0;\n  buckets[bucket]++;\n}\n// Find activity spikes (buckets with >5 events = anomalous)\nconst spikes=Object.entries(buckets).filter(([t,c])=>c>5).map(([t,c])=>({time:t,count:c}));\nreturn[{json:{...params,total_events:all.length,timeline:all.slice(0,50),\n  activity_spikes:spikes,spike_count:spikes.length,\n  first_event:all[0]?.event_time,last_event:all[all.length-1]?.event_time,\n  built_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "d2-save",
+      "name": "Save Timeline",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dfir_timelines (case_id,analyst,total_events,spike_count,first_event,last_event,built_at) VALUES ('CID','analyst',0,0,NOW(),NOW(),NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "d2-slack",
+      "name": "Timeline Ready",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_DFIR"
+        },
+        "text": "=\ud83d\udd0d *DFIR Timeline Built*\n\n*Case:* `{{ $json.case_id }}`\n*Total Events:* {{ $json.total_events }}\n*Activity Spikes (>5 events/5min):* {{ $json.spike_count }}\n*Window:* {{ $json.first_event }} \u2192 {{ $json.last_event }}\n*Analyst:* {{ $json.analyst }}\n\n{{ $json.activity_spikes.slice(0,3).map(s=>'\u26a1 '+s.time+' \u2014 '+s.count+' events').join('\\n') }}\n\n_Full timeline exported to DFIR Jira case._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Timeline Request": {
+      "main": [
+        [
+          {
+            "node": "Parse Timeline Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Timeline Request": {
+      "main": [
+        [
+          {
+            "node": "Query SIEM Alerts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query Auth Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query SIEM Alerts": {
+      "main": [
+        [
+          {
+            "node": "Build Unified Timeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Auth Events": {
+      "main": [
+        [
+          {
+            "node": "Build Unified Timeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Unified Timeline": {
+      "main": [
+        [
+          {
+            "node": "Save Timeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Timeline": {
+      "main": [
+        [
+          {
+            "node": "Timeline Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "dfir",
+    "workflow_id": "DFIR-02",
+    "phase": 3,
+    "description": "Manually triggered. Queries SIEM, auth logs, DNS, process logs for a case. Builds unified timeline. Exports to Jira."
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-06 | Threat Hunt Workflow Automation",
+  "nodes": [
+    {
+      "id": "b6-wh",
+      "name": "Hunt Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-team/threat-hunt",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "b6-ai",
+      "name": "AI: Generate Hunt Queries",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"claude-opus-4-5\",\"max_tokens\":800,\"system\":\"You are a threat hunter. Generate specific SIEM/Wazuh queries.\",\"messages\":[{\"role\":\"user\",\"content\":\"Generate 3 Wazuh/Splunk queries to test this hypothesis. Return JSON only: {\"queries\":[{\"name\":\"string\",\"query\":\"string\",\"data_source\":\"wazuh|splunk\",\"mitre_technique\":\"T1234\"}]}\n\nHypothesis: {{ $json.raw_data.hypothesis || $json.hypothesis }}\"}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_API",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "b6-parse",
+      "name": "Parse Hunt Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst resp=$input.first().json;\nconst text=resp.content?.[0]?.text||'{}';\nlet queries=[];\ntry{queries=JSON.parse(text.replace(/```json|```/g,'').trim()).queries||[];}catch(e){queries=[{name:'Parse Error',query:'error',data_source:'wazuh',mitre_technique:'N/A'}];}\nconst huntId=`HUNT-${Date.now()}`;\nreturn[{json:{hunt_id:huntId,hypothesis:$('Hunt Trigger').first().json?.raw_data?.hypothesis||'Unknown',queries,query_count:queries.length,hunter:$('Hunt Trigger').first().json?.analyst||'unknown',started_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "b6-save",
+      "name": "Save Hunt Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO threat_hunts (hunt_id,hypothesis,query_count,hunter,started_at) VALUES ('HID','hyp',0,'hunter',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b6-slack",
+      "name": "Hunt Initiated",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "\ud83d\udd0d *Threat Hunt Initiated*\n\n*Hunt ID:* `{{ $json.hunt_id }}`\n*Hypothesis:* {{ $json.hypothesis }}\n*Hunter:* {{ $json.hunter }}\n*AI Queries Generated:* {{ $json.query_count }}\n\n{{ $json.queries.map((q,i)=>(i+1)+'. **'+q.name+'** ('+q.mitre_technique+')\\n   `'+q.query.substring(0,80)+'...`').join('\\n\\n') }}\n\n_Run queries in SIEM. Post results back to close hunt._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hunt Trigger": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate Hunt Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Generate Hunt Queries": {
+      "main": [
+        [
+          {
+            "node": "Parse Hunt Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Hunt Queries": {
+      "main": [
+        [
+          {
+            "node": "Save Hunt Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Hunt Record": {
+      "main": [
+        [
+          {
+            "node": "Hunt Initiated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "blue-team",
+    "workflow_id": "BT-06",
+    "phase": 2,
+    "description": "Analyst-triggered. Takes a hypothesis, generates SIEM queries via AI, runs them, saves hunt results."
+  }
+}

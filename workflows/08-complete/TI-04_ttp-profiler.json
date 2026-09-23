@@ -1,0 +1,238 @@
+{
+  "name": "\ud83d\udd75\ufe0f TI-04 | Threat Actor TTP Profiler (MITRE ATT&CK)",
+  "nodes": [
+    {
+      "id": "ti4-cron",
+      "name": "Weekly Monday 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ti4-otx",
+      "name": "Fetch Recent Threat Actor Pulses",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50&modified_since={{ new Date(Date.now()-7*86400000).toISOString() }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-OTX-API-KEY",
+              "value": "={{ $credentials.otxApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "OTX_API",
+          "name": "OTX API"
+        }
+      }
+    },
+    {
+      "id": "ti4-extract",
+      "name": "Extract TTPs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst pulses=$input.first().json?.results||[];\nconst profiles=[];\nfor(const p of pulses){\n  const ttps=(p.attack_ids||[]).map(t=>({id:t.id||t,name:t.display_name||t.id||t,phase:t.type||'Unknown'}));\n  if(ttps.length===0) continue;\n  const ioc_types={};\n  (p.indicators||[]).forEach(i=>{ioc_types[i.type]=(ioc_types[i.type]||0)+1;});\n  profiles.push({actor_name:p.author_name||'Unknown',campaign_name:p.name,\n    description:p.description?.substring(0,200)||'',\n    ttps,ttp_count:ttps.length,ioc_count:p.indicators?.length||0,ioc_breakdown:ioc_types,\n    targeted_industries:(p.industries||[]),tlp:p.TLP_||'white',\n    source_pulse:p.id,discovered_at:p.modified||new Date().toISOString()});\n}\nreturn[{json:{profiles,total_campaigns:profiles.length,total_ttps:profiles.reduce((s,p)=>s+p.ttp_count,0),\n  extracted_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "ti4-ai",
+      "name": "AI: Threat Actor Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"claude-haiku-4-5\",\"max_tokens\":400,\"messages\":[{\"role\":\"user\",\"content\":\"Summarize these threat actor campaigns for a SOC team. Identify: 1) Which industries are targeted 2) Common TTPs across campaigns 3) One detection recommendation. 100 words max.\\n\\n{{ JSON.stringify($json.profiles.slice(0,5)) }}\"}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_API",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "ti4-store",
+      "name": "Store TTP Profiles",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO threat_actor_profiles (actor_name,campaign_name,ttp_count,ioc_count,tlp,discovered_at) VALUES ('actor','campaign',0,0,'white',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ti4-slack",
+      "name": "TTP Profile Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "=\ud83d\udd75\ufe0f *Weekly Threat Actor Intelligence*\n\n*Campaigns Analysed:* {{ $json.total_campaigns }}\n*Total TTPs Mapped:* {{ $json.total_ttps }}\n\n*AI Summary:*\n{{ $('AI: Threat Actor Summary').first().json?.content?.[0]?.text||'Summary unavailable' }}\n\n{{ $json.profiles.slice(0,3).map(p=>'\u2022 '+p.campaign_name+' ('+p.ttp_count+' TTPs, '+p.ioc_count+' IOCs)').join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Monday 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Recent Threat Actor Pulses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Recent Threat Actor Pulses": {
+      "main": [
+        [
+          {
+            "node": "Extract TTPs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract TTPs": {
+      "main": [
+        [
+          {
+            "node": "AI: Threat Actor Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Threat Actor Summary": {
+      "main": [
+        [
+          {
+            "node": "Store TTP Profiles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store TTP Profiles": {
+      "main": [
+        [
+          {
+            "node": "TTP Profile Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "threat-intel",
+    "workflow_id": "TI-04",
+    "phase": 1,
+    "description": "Weekly: ingests threat actor reports from OTX, maps TTPs to MITRE ATT&CK, stores profiles, updates SIEM rules."
+  }
+}

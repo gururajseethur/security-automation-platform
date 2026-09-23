@@ -1,0 +1,220 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-02 | Threat Intel IOC Ingestion to SIEM",
+  "nodes": [
+    {
+      "id": "b2-cron",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */4 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b2-fresh",
+      "name": "Fetch Fresh IOCs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT batch_id,type,value,malware_family,confidence,source FROM threat_iocs WHERE ingested_at >= NOW() - INTERVAL '4 hours' AND type IN ('ip','domain','hash') ORDER BY confidence DESC LIMIT 500;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b2-split",
+      "name": "Split by IOC Type",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst iocs=$input.all().map(i=>i.json);\nconst byType={ip:[],domain:[],hash:[]};\nfor(const i of iocs){if(byType[i.type])byType[i.type].push(i.value);}\nreturn[{json:{...byType,total:iocs.length,ip_count:byType.ip.length,domain_count:byType.domain.length,hash_count:byType.hash.length,pushed_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "b2-wazuh",
+      "name": "Push to Wazuh Active Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.wazuhApi.host }}:55000/active-response",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"command\":\"firewall-drop\",\"arguments\":[{{ $json.ip.slice(0,50).map(ip=>\"\"\"+ip+\"\"\").join(\",\") }}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.wazuhApi.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WAZUH_API",
+          "name": "Wazuh API"
+        }
+      }
+    },
+    {
+      "id": "b2-expire",
+      "name": "Expire Old IOCs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE threat_iocs SET active=false WHERE ingested_at < NOW() - INTERVAL '30 days' AND active=true;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "b2-slack",
+      "name": "IOC Push Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_ALERTS"
+        },
+        "text": "\ud83d\udee1\ufe0f *IOC Sync Complete*\n\n*Pushed to Wazuh:* {{ $json.total }}\n*IPs:* {{ $json.ip_count }} | *Domains:* {{ $json.domain_count }} | *Hashes:* {{ $json.hash_count }}\n*Pushed at:* {{ $json.pushed_at }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch Fresh IOCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Fresh IOCs": {
+      "main": [
+        [
+          {
+            "node": "Split by IOC Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split by IOC Type": {
+      "main": [
+        [
+          {
+            "node": "Push to Wazuh Active Response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Expire Old IOCs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push to Wazuh Active Response": {
+      "main": [
+        [
+          {
+            "node": "IOC Push Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expire Old IOCs": {
+      "main": [
+        [
+          {
+            "node": "IOC Push Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "blue-team",
+    "workflow_id": "BT-02",
+    "phase": 2,
+    "description": "Deduplicates IOCs from TI-02 and pushes to Wazuh/Splunk blocklists. Maintains freshness \u2014 expires IOCs > 30 days old."
+  }
+}

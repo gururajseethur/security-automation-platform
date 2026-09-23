@@ -1,0 +1,197 @@
+{
+  "name": "\ud83d\udcbb EP-02 | Patch Compliance Tracker",
+  "nodes": [
+    {
+      "id": "e2-cron",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e2-mdm",
+      "name": "Fetch MDM Patch Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.mdmApi.host }}/api/v1/devices?missing_patches=true&limit=200",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.mdmApi.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "MDM_API",
+          "name": "MDM API"
+        }
+      }
+    },
+    {
+      "id": "e2-score",
+      "name": "Score Patch Urgency",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst devices=$input.first().json?.devices||[];\nconst urgent=[];\nfor(const d of devices){\n  for(const patch of (d.missing_patches||[])){\n    const cvss=parseFloat(patch.cvss_score||0);\n    const days_missing=patch.days_missing||0;\n    let priority='P4',sla=30;\n    if(cvss>=9){priority='P1';sla=1;}\n    else if(cvss>=7){priority='P2';sla=7;}\n    else if(cvss>=4){priority='P3';sla=14;}\n    const sla_breached=days_missing>sla;\n    if(cvss>=7||sla_breached) urgent.push({device_id:d.device_id,hostname:d.hostname,owner_email:d.owner_email,\n      patch_id:patch.id,patch_name:patch.name,cvss,priority,days_missing,sla,sla_breached});\n  }\n}\nurgent.sort((a,b)=>b.cvss-a.cvss);\nconst p1_breach=urgent.filter(u=>u.priority==='P1'&&u.sla_breached);\nreturn[{json:{total_urgent:urgent.length,p1_breaches:p1_breach.length,sla_breached:urgent.filter(u=>u.sla_breached).length,urgent:urgent.slice(0,20),p1_breach_list:p1_breach}}];"
+      }
+    },
+    {
+      "id": "e2-jira",
+      "name": "Create Patch Tickets",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "PATCH",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[PATCH-COMPLIANCE] {{ $json.total_urgent }} urgent | {{ $json.p1_breaches }} P1 SLA breaches",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.p1_breaches>0?'Highest':'High' }}"
+          },
+          "labels": [
+            "patch",
+            "compliance",
+            "endpoint"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "e2-slack",
+      "name": "Patch Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_ENDPOINT_SEC"
+        },
+        "text": "=\ud83d\udcbb *Daily Patch Compliance*\n\n*Urgent (CVSS\u22657):* {{ $json.total_urgent }}\n*P1 SLA Breaches:* {{ $json.p1_breaches }}\n{{ $json.p1_breaches>0?'\\n\ud83d\udd34 *Critical SLA Breaches:*\\n'+$json.p1_breach_list.slice(0,3).map(p=>'\u2022 '+p.hostname+': '+p.patch_name+' (CVSS '+p.cvss+', '+p.days_missing+'d overdue)').join('\\n')+'\\n':'' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch MDM Patch Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch MDM Patch Status": {
+      "main": [
+        [
+          {
+            "node": "Score Patch Urgency",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Patch Urgency": {
+      "main": [
+        [
+          {
+            "node": "Create Patch Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Patch Tickets": {
+      "main": [
+        [
+          {
+            "node": "Patch Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "endpoint",
+    "workflow_id": "EP-02",
+    "phase": 2,
+    "description": "Daily MDM scan for missing patches. Assigns to asset owner. SLA countdown. Escalates to CISO if critical patch SLA missed."
+  }
+}

@@ -1,0 +1,228 @@
+{
+  "name": "\ud83c\udf93 AWR-03 | Weekly Staff Threat Digest Emailer",
+  "nodes": [
+    {
+      "id": "a3-cron",
+      "name": "Friday 16:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 16 * * 5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a3-threats",
+      "name": "Fetch Week's Top Threats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT malware_family,COUNT(*) as hits,MAX(confidence) as max_conf FROM threat_iocs WHERE ingested_at >= NOW() - INTERVAL '7 days' GROUP BY malware_family ORDER BY hits DESC LIMIT 5;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "a3-phish",
+      "name": "Fetch Phishing Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT AVG(click_rate)::NUMERIC(5,1) as avg_click_rate, SUM(clicked) as total_clicked FROM phishing_campaign_results WHERE analysed_at >= NOW() - INTERVAL '7 days';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "a3-ai",
+      "name": "AI: Write Staff Digest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"claude-haiku-4-5\",\"max_tokens\":500,\"messages\":[{\"role\":\"user\",\"content\":\"Write a friendly, jargon-free weekly security digest for non-technical staff. 150 words max. 3 sections: What we saw this week, What to watch out for, One quick tip. Data: threats={{ JSON.stringify($json.threats) }}, phishing_click_rate={{ $json.phishing_stats?.avg_click_rate }}%\"}]}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_API",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "id": "a3-format",
+      "name": "Format Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ai=$input.first().json;\nconst digest=ai.content?.[0]?.text||'Weekly security update \u2014 see IT Security for details.';\nreturn[{json:{digest,subject:`Your Weekly Security Digest \u2014 ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'long'})}`,formatted_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "a3-slack",
+      "name": "Post Digest to #general",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GENERAL"
+        },
+        "text": "=\ud83c\udf93 *Weekly Security Digest*\n\n{{ $json.digest }}\n\n_\u2014 Cyber Constellation Security Team_",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Friday 16:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Week's Top Threats",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Phishing Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Week's Top Threats": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Staff Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Phishing Stats": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Staff Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Write Staff Digest": {
+      "main": [
+        [
+          {
+            "node": "Format Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest": {
+      "main": [
+        [
+          {
+            "node": "Post Digest to #general",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "awareness",
+    "workflow_id": "AWR-03",
+    "phase": 1,
+    "description": "Friday 16:00: pulls top threats from TI agent + current phishing campaigns. AI generates staff-friendly digest. Emails all staff."
+  }
+}

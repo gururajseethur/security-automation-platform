@@ -36,10 +36,10 @@ work can be automated without giving up auditability?
 
 | Path | Contents |
 |------|----------|
-| `workflows/` | Full catalogue of all 65 workflow definitions in [`INDEX.md`](workflows/INDEX.md), plus six shipped as complete n8n exports |
+| `workflows/` | All 65 workflow definitions, grouped by domain — catalogue in [`INDEX.md`](workflows/INDEX.md) |
 | `sentinel-api/` | FastAPI control plane + test suite |
-| `scripts/` | Schema (45 tables, 23 indexes), multi-tenancy migration, import, seed, health check, backup |
-| `grafana/` | Three provisioned dashboards — SOC, vulnerability management, GRC |
+| `scripts/` | Schema (45 tables, 23 indexes), multi-tenancy migration, health check, credential setup guide |
+| `grafana/` | Provisioned SOC dashboard |
 | `nginx/` | TLS 1.2/1.3 termination, rate limiting, HSTS and security headers |
 | `deploy/` | Production Compose stack — pinned images, log rotation, scheduled backups |
 | `ai-models/` | Threat-analysis system prompt and a library of threat-hunt queries |

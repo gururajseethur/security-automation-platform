@@ -1,0 +1,432 @@
+{
+  "name": "\ud83d\udd2c VM-03 | CVSS + EPSS Risk Prioritizer",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "vm-cron-01",
+      "name": "Daily 06:00 Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "notes": "Runs every weekday at 06:00. Fetches and re-scores all open critical/high vulnerabilities."
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "vulnerabilities"
+        },
+        "where": {
+          "values": [
+            {
+              "column": "status",
+              "value": "open"
+            },
+            {
+              "column": "cvss_score",
+              "value": 7.0,
+              "condition": ">="
+            }
+          ]
+        },
+        "sort": {
+          "values": [
+            {
+              "column": "cvss_score",
+              "direction": "DESC"
+            }
+          ]
+        },
+        "limit": 200,
+        "options": {}
+      },
+      "id": "vm-fetch-02",
+      "name": "Fetch Open High Vulns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 50,
+        "options": {}
+      },
+      "id": "vm-batch-03",
+      "name": "Batch CVEs (50 at a time)",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build comma-separated CVE ID list for EPSS bulk API call\nconst items = $input.all();\nconst cveIds = items.map(i => i.json.cve_id).filter(Boolean);\n\nreturn [{ json: { cve_ids: cveIds, cve_list: cveIds.join(','), batch_size: cveIds.length, items: items.map(i => i.json) } }];"
+      },
+      "id": "vm-buildlist-04",
+      "name": "Build CVE List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.first.org/data/v1/epss?cve={{ $json.cve_list }}&pretty=true",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "vm-epss-05",
+      "name": "Fetch EPSS Scores",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1040,
+        180
+      ],
+      "notes": "EPSS API (first.org) \u2014 free, no auth required. Returns probability of exploitation in next 30 days."
+    },
+    {
+      "parameters": {
+        "url": "=https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={{ $json.cve_ids.slice(0,5).join('&cveId=') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apiKey",
+              "value": "={{ $credentials.nvdApi.apiKey }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "vm-nvd-06",
+      "name": "Fetch NVD CVSS v3 Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1040,
+        420
+      ],
+      "notes": "NVD API v2 \u2014 free with API key (500 req/30s). Provides CVSS v3 vector, severity, CWE.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "NVD_API",
+          "name": "NVD API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500\u2500 COMPOSITE RISK SCORING ENGINE \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Combines CVSS v3 Base Score + EPSS Probability + Asset Criticality\n// to produce a prioritized risk score (0\u2013100) for each vulnerability.\n\nconst batchData = $('Build CVE List').first().json;\nconst epssData = $('Fetch EPSS Scores').first().json;\nconst nvdData = $('Fetch NVD CVSS v3 Data').first().json;\n\n// Build EPSS lookup map: cve_id \u2192 epss_score\nconst epssMap = {};\nif (epssData.data) {\n  for (const entry of epssData.data) {\n    epssMap[entry.cve] = {\n      epss: parseFloat(entry.epss),\n      percentile: parseFloat(entry.percentile)\n    };\n  }\n}\n\n// Build NVD lookup map\nconst nvdMap = {};\nif (nvdData.vulnerabilities) {\n  for (const v of nvdData.vulnerabilities) {\n    const cve = v.cve;\n    const metrics = cve.metrics?.cvssMetricV31?.[0] || cve.metrics?.cvssMetricV30?.[0];\n    nvdMap[cve.id] = {\n      cvss_v3: metrics?.cvssData?.baseScore || null,\n      cvss_vector: metrics?.cvssData?.vectorString || null,\n      attack_vector: metrics?.cvssData?.attackVector || null,\n      privileges_required: metrics?.cvssData?.privilegesRequired || null,\n      user_interaction: metrics?.cvssData?.userInteraction || null,\n      description: cve.descriptions?.find(d => d.lang === 'en')?.value || 'No description',\n      cwe: cve.weaknesses?.[0]?.description?.[0]?.value || null,\n      published: cve.published\n    };\n  }\n}\n\n// Score each vulnerability\nconst scored = batchData.items.map(vuln => {\n  const cveId = vuln.cve_id;\n  const epss = epssMap[cveId] || { epss: 0, percentile: 0 };\n  const nvd = nvdMap[cveId] || {};\n  \n  // Use NVD score if available, fall back to stored score\n  const cvssScore = nvd.cvss_v3 || vuln.cvss_score || 0;\n  \n  // \u2500\u2500 Composite Score Formula \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  // CVSS contributes 40%: normalized to 0-100\n  const cvssNorm = (cvssScore / 10) * 100;\n  \n  // EPSS contributes 45%: probability \u00d7 100\n  const epssNorm = epss.epss * 100;\n  \n  // Asset criticality contributes 15%\n  const critMap = { critical: 100, high: 80, medium: 60, low: 40, unknown: 50 };\n  const assetCrit = critMap[vuln.asset_criticality?.toLowerCase()] || 50;\n  \n  const compositeScore = Math.round(\n    (cvssNorm * 0.40) + (epssNorm * 0.45) + (assetCrit * 0.15)\n  );\n  \n  // \u2500\u2500 Priority Tier \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  let priority = 'P4-Low';\n  let sla_days = 30;\n  if (compositeScore >= 85)      { priority = 'P1-Critical'; sla_days = 1; }\n  else if (compositeScore >= 70) { priority = 'P2-High';     sla_days = 7; }\n  else if (compositeScore >= 50) { priority = 'P3-Medium';   sla_days = 14; }\n  \n  // Check if SLA is already breached\n  const daysOpen = vuln.created_at ?\n    Math.floor((Date.now() - new Date(vuln.created_at)) / 86400000) : 0;\n  const sla_due_date = new Date(Date.now() + sla_days * 86400000).toISOString().split('T')[0];\n  const sla_breached = daysOpen > sla_days;\n  \n  return {\n    ...vuln,\n    // Enriched CVSS\n    cvss_v3: cvssScore,\n    cvss_vector: nvd.cvss_vector || vuln.cvss_vector,\n    attack_vector: nvd.attack_vector,\n    cwe: nvd.cwe,\n    vuln_description: nvd.description || vuln.description,\n    nvd_published: nvd.published,\n    // EPSS\n    epss_score: epss.epss,\n    epss_percentile: epss.percentile,\n    epss_pct_display: `${(epss.epss * 100).toFixed(2)}%`,\n    // Composite scoring\n    composite_score: compositeScore,\n    priority_tier: priority,\n    sla_days,\n    sla_due_date,\n    days_open: daysOpen,\n    sla_breached,\n    // Breakdown\n    score_breakdown: {\n      cvss_contribution: Math.round(cvssNorm * 0.40),\n      epss_contribution: Math.round(epssNorm * 0.45),\n      asset_contribution: Math.round(assetCrit * 0.15)\n    }\n  };\n});\n\n// Sort by composite score descending\nscored.sort((a, b) => b.composite_score - a.composite_score);\n\n// Separate SLA breaches for escalation\nconst sla_breached = scored.filter(v => v.sla_breached);\nconst p1_critical = scored.filter(v => v.priority_tier === 'P1-Critical');\n\nreturn [{\n  json: {\n    scored_vulns: scored,\n    total: scored.length,\n    p1_count: p1_critical.length,\n    sla_breach_count: sla_breached.length,\n    sla_breached_ids: sla_breached.map(v => v.cve_id),\n    top_10: scored.slice(0, 10),\n    scored_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "vm-score-07",
+      "name": "Compute Composite Risk Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "vulnerabilities"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "epss_score": "={{ $json.epss_score }}",
+            "composite_score": "={{ $json.composite_score }}",
+            "priority_tier": "={{ $json.priority_tier }}",
+            "sla_days": "={{ $json.sla_days }}",
+            "sla_due_date": "={{ $json.sla_due_date }}",
+            "sla_breached": "={{ $json.sla_breached }}",
+            "last_scored_at": "={{ $json.scored_at }}"
+          }
+        },
+        "where": {
+          "values": [
+            {
+              "column": "cve_id",
+              "value": "={{ $json.cve_id }}"
+            }
+          ]
+        }
+      },
+      "id": "vm-update-08",
+      "name": "Update Vuln Priority in DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "sla-check",
+              "leftValue": "={{ $json.sla_breach_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "vm-sla-gate-09",
+      "name": "SLA Breaches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_VULN_MGMT"
+        },
+        "text": "\u26a0\ufe0f *SLA Breach Alert \u2014 {{ $json.sla_breach_count }} Overdue Vulnerabilities*\n\n*P1 Critical:* {{ $json.p1_count }} | *SLA Breaches:* {{ $json.sla_breach_count }}\n*Scored:* {{ $json.total }} vulnerabilities\n\n*Top 5 by Composite Score:*\n{{ $json.top_10.slice(0,5).map(v => '\u2022 `' + v.cve_id + '` \u2014 CVSS: ' + v.cvss_v3 + ' | EPSS: ' + v.epss_pct_display + ' | Score: ' + v.composite_score + ' | ' + v.priority_tier + (v.sla_breached ? ' \u23f0 SLA BREACHED' : '')).join('\\n') }}\n\n:arrow_right: Review full priority list in Jira VM board.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "vm-slack-09",
+      "name": "Slack: SLA Breach Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        280
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_VULN_MGMT"
+        },
+        "text": "\u2705 *Daily Vuln Scoring Complete \u2014 No SLA Breaches*\n\n*Scored:* {{ $json.total }} vulnerabilities\n*P1 Critical:* {{ $json.p1_count }} | *P2 High:* {{ $json.scored_vulns.filter(v => v.priority_tier === 'P2-High').length }}\n\n*Top 3 by Risk Score:*\n{{ $json.top_10.slice(0,3).map(v => '\u2022 `' + v.cve_id + '` \u2014 Score: ' + v.composite_score + ' | EPSS: ' + v.epss_pct_display).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "vm-slack-ok-10",
+      "name": "Slack: Daily Summary",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        480
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 06:00 Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open High Vulns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open High Vulns": {
+      "main": [
+        [
+          {
+            "node": "Batch CVEs (50 at a time)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch CVEs (50 at a time)": {
+      "main": [
+        [
+          {
+            "node": "Build CVE List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build CVE List": {
+      "main": [
+        [
+          {
+            "node": "Fetch EPSS Scores",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch NVD CVSS v3 Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch EPSS Scores": {
+      "main": [
+        [
+          {
+            "node": "Compute Composite Risk Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch NVD CVSS v3 Data": {
+      "main": [
+        [
+          {
+            "node": "Compute Composite Risk Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Composite Risk Score": {
+      "main": [
+        [
+          {
+            "node": "Update Vuln Priority in DB",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SLA Breaches?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SLA Breaches?": {
+      "main": [
+        [
+          {
+            "node": "Slack: SLA Breach Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "tags": [
+    {
+      "name": "vuln-mgmt"
+    },
+    {
+      "name": "epss"
+    },
+    {
+      "name": "phase-1"
+    }
+  ],
+  "meta": {
+    "constellation_version": "1.0",
+    "domain": "vuln-mgmt",
+    "agent": "vuln-agent",
+    "workflow_id": "VM-03",
+    "phase": 1,
+    "schedule": "0 6 * * 1-5",
+    "credentials_required": [
+      "POSTGRES_MAIN",
+      "SLACK_MAIN",
+      "NVD_API"
+    ],
+    "description": "Runs every weekday morning. Fetches all open high/critical CVEs, enriches with EPSS exploitation probability scores from FIRST.org, computes composite risk score (CVSS 40% + EPSS 45% + asset criticality 15%), re-ranks priority queue, and alerts on SLA breaches."
+  }
+}

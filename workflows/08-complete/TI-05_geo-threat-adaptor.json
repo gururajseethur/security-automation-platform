@@ -1,0 +1,201 @@
+{
+  "name": "\ud83d\udd75\ufe0f TI-05 | Geopolitical Threat Level Adaptor",
+  "nodes": [
+    {
+      "id": "ti5-cron",
+      "name": "Weekly Monday 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ti5-news",
+      "name": "Fetch Geopolitical OSINT",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "https://feeds.feedburner.com/TheHackersNews",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "ti5-cisa",
+      "name": "Fetch CISA Advisories",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        380
+      ],
+      "parameters": {
+        "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "ti5-assess",
+      "name": "Assess Threat Posture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst news=$('Fetch Geopolitical OSINT').first().json;\nconst cisa=$('Fetch CISA Advisories').first().json;\n// Count recent CISA KEV additions (past 7 days)\nconst recent_kev=(cisa?.vulnerabilities||[]).filter(v=>{\n  const added=new Date(v.dateAdded||0);\n  return (Date.now()-added)<7*86400000;\n});\nconst kev_count=recent_kev.length;\n// Determine threat level\nlet threat_level='NORMAL';let sensitivity_multiplier=1.0;\nif(kev_count>=10){threat_level='HIGH';sensitivity_multiplier=1.3;}\nelse if(kev_count>=5){threat_level='ELEVATED';sensitivity_multiplier=1.15;}\nreturn[{json:{threat_level,sensitivity_multiplier,kev_this_week:kev_count,\n  top_kev:recent_kev.slice(0,5).map(v=>({cve:v.cveID,vendor:v.vendorProject,product:v.product})),\n  recommendation:threat_level==='HIGH'?'Increase log retention, enable verbose alerting, review firewall rules':\n                 threat_level==='ELEVATED'?'Review patch queue, enable enhanced monitoring':'Maintain normal posture',\n  assessed_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "ti5-store",
+      "name": "Store Threat Assessment",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO geopolitical_assessments (threat_level,sensitivity_multiplier,kev_count,assessed_at) VALUES ('NORMAL',1.0,0,NOW());",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "ti5-slack",
+      "name": "Geopolitical Threat Brief",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_THREAT_INTEL"
+        },
+        "text": "=\ud83d\udd75\ufe0f *Weekly Geopolitical Threat Assessment*\n\n*Threat Level:* {{ $json.threat_level === 'HIGH' ? '\ud83d\udd34 HIGH' : $json.threat_level === 'ELEVATED' ? '\ud83d\udfe1 ELEVATED' : '\ud83d\udfe2 NORMAL' }}\n*CISA KEV Additions This Week:* {{ $json.kev_this_week }}\n*Monitoring Sensitivity:* {{ $json.sensitivity_multiplier }}x\n\n*Top New Exploited Vulns:*\n{{ $json.top_kev.slice(0,3).map(v=>'\u2022 '+v.cve+' \u2014 '+v.vendor+' '+v.product).join('\\n') }}\n\n*Recommendation:* {{ $json.recommendation }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Monday 06:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Geopolitical OSINT",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch CISA Advisories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Geopolitical OSINT": {
+      "main": [
+        [
+          {
+            "node": "Assess Threat Posture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch CISA Advisories": {
+      "main": [
+        [
+          {
+            "node": "Assess Threat Posture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assess Threat Posture": {
+      "main": [
+        [
+          {
+            "node": "Store Threat Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Threat Assessment": {
+      "main": [
+        [
+          {
+            "node": "Geopolitical Threat Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "threat-intel",
+    "workflow_id": "TI-05",
+    "phase": 3,
+    "description": "Weekly: assesses geopolitical threat posture from OSINT feeds. Adjusts monitoring sensitivity. Notifies CISO of elevated risk."
+  }
+}

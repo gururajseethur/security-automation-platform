@@ -1,0 +1,169 @@
+{
+  "name": "\ud83c\udf93 AWR-05 | Security Champion Leaderboard",
+  "nodes": [
+    {
+      "id": "a5-cron",
+      "name": "Friday 17:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 17 * * 5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a5-training",
+      "name": "Training Completions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT u.email,u.full_name,u.department,COUNT(*) as training_score FROM training_completions t JOIN staff u ON t.employee_id=u.employee_id WHERE t.completed_at >= NOW() - INTERVAL '30 days' GROUP BY u.email,u.full_name,u.department;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "a5-feedback",
+      "name": "Feedback Submissions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT analyst as email,COUNT(*) as feedback_score FROM analyst_feedback WHERE submitted_at >= NOW() - INTERVAL '30 days' AND verdict='true_positive' GROUP BY analyst;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "a5-score",
+      "name": "Calculate Champion Scores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst training=$('Training Completions').all().map(i=>i.json);\nconst feedback=$('Feedback Submissions').all().map(i=>i.json);\nconst scores={};\nfor(const t of training){\n  if(!scores[t.email]) scores[t.email]={name:t.full_name,dept:t.department,email:t.email,total:0,training:0,feedback:0};\n  scores[t.email].training+=parseInt(t.training_score||0)*10; // 10pts per training\n  scores[t.email].total+=scores[t.email].training;\n}\nfor(const f of feedback){\n  if(!scores[f.email]) scores[f.email]={name:f.email,dept:'Unknown',email:f.email,total:0,training:0,feedback:0};\n  scores[f.email].feedback+=parseInt(f.feedback_score||0)*5; // 5pts per TP verdict\n  scores[f.email].total+=scores[f.email].feedback;\n}\nconst ranked=Object.values(scores).sort((a,b)=>b.total-a.total).slice(0,10);\nconst medals=['\ud83e\udd47','\ud83e\udd48','\ud83e\udd49','4\ufe0f\u20e3','5\ufe0f\u20e3','6\ufe0f\u20e3','7\ufe0f\u20e3','8\ufe0f\u20e3','9\ufe0f\u20e3','\ud83d\udd1f'];\nreturn[{json:{ranked:ranked.map((r,i)=>({...r,rank:i+1,medal:medals[i]||String(i+1)})),top3:ranked.slice(0,3),week_ending:new Date().toISOString().split('T')[0]}}];"
+      }
+    },
+    {
+      "id": "a5-slack",
+      "name": "Post Leaderboard",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GENERAL"
+        },
+        "text": "=\ud83c\udf93 *Security Champion Leaderboard \u2014 Week of {{ $json.week_ending }}*\n\n{{ $json.ranked.slice(0,5).map(r=>r.medal+' *'+r.name+'* ('+r.dept+') \u2014 '+r.total+' pts (Training: '+r.training+' | Feedback: '+r.feedback+')').join('\\n') }}\n\n_Points: 10pts per training completed \u00b7 5pts per TP alert verdict_\n_Report phishing emails and security issues to earn more points!_",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Friday 17:00": {
+      "main": [
+        [
+          {
+            "node": "Training Completions",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Feedback Submissions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Training Completions": {
+      "main": [
+        [
+          {
+            "node": "Calculate Champion Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback Submissions": {
+      "main": [
+        [
+          {
+            "node": "Calculate Champion Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Champion Scores": {
+      "main": [
+        [
+          {
+            "node": "Post Leaderboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "awareness",
+    "workflow_id": "AWR-05",
+    "phase": 1,
+    "description": "Weekly gamified leaderboard. Tracks: trainings completed, phishing reported, vulns reported, feedback submitted. Posts to Slack."
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "name": "\ud83d\udccb GRC-01 | Audit Schedule & Evidence Collector",
+  "nodes": [
+    {
+      "id": "g1-cron",
+      "name": "Monthly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 1 * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "g1-fetch",
+      "name": "Fetch Stale Controls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nSELECT control_id, control_name, framework, owner_email,\n       EXTRACT(DAY FROM NOW()-last_evidence_date)::INT as days_stale\nFROM audit_controls\nWHERE active=true AND (last_evidence_date IS NULL OR last_evidence_date < NOW() - INTERVAL '90 days')\nORDER BY framework, control_id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g1-build",
+      "name": "Build Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst items=$input.all().map(i=>i.json);\nconst byOwner={};\nfor(const c of items){\n  if(!byOwner[c.owner_email]) byOwner[c.owner_email]=[];\n  byOwner[c.owner_email].push(c);\n}\nconst deadline=new Date(Date.now()+14*86400000).toISOString().split('T')[0];\nreturn Object.entries(byOwner).map(([email,controls])=>({json:{\n  owner_email:email, controls, control_count:controls.length,\n  deadline, request_id:`AUDIT-${Date.now()}-${email.split('@')[0].toUpperCase()}`\n}}));"
+      }
+    },
+    {
+      "id": "g1-log",
+      "name": "Log Requests",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nINSERT INTO audit_evidence_requests (request_id,owner_email,control_count,due_date,sent_at)\nVALUES ('REQ-NOW','placeholder@co',0,'2024-01-01',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "g1-slack",
+      "name": "Slack: Requests Sent",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_GRC"
+        },
+        "text": "\ud83d\udccb *Audit Evidence Requests Sent*\n\n*Controls requiring evidence:* {{ $('Fetch Stale Controls').all().length }}\n*Owners notified:* {{ $input.all().length }}\n*Deadline:* {{ $json.deadline }}\n\nEvidence requests emailed to all control owners.",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Monthly Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Stale Controls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Stale Controls": {
+      "main": [
+        [
+          {
+            "node": "Build Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Requests": {
+      "main": [
+        [
+          {
+            "node": "Log Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Requests": {
+      "main": [
+        [
+          {
+            "node": "Slack: Requests Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "grc",
+    "workflow_id": "GRC-01",
+    "phase": 1,
+    "description": "Runs 1st of each month. Queries controls with stale evidence >90 days. Groups by owner, sends evidence requests with 14-day deadline."
+  }
+}

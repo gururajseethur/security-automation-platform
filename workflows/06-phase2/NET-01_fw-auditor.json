@@ -1,0 +1,197 @@
+{
+  "name": "\ud83c\udf10 NET-01 | Firewall Rule Hygiene Auditor",
+  "nodes": [
+    {
+      "id": "n1-cron",
+      "name": "Weekly Wednesday 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 3"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n1-fw",
+      "name": "Fetch Firewall Rules",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://{{ $credentials.firewallApi.host }}/api/v1/rules",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.firewallApi.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "FIREWALL_API",
+          "name": "Firewall API"
+        }
+      }
+    },
+    {
+      "id": "n1-audit",
+      "name": "Audit Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst rules=$input.first().json?.rules||[];\nconst issues=[];\nfor(const r of rules){\n  const srcAny=r.source==='any'||r.source==='0.0.0.0/0';\n  const dstAny=r.destination==='any'||r.destination==='0.0.0.0/0';\n  const lastUsed=r.last_hit?Math.floor((Date.now()-new Date(r.last_hit))/86400000):999;\n  if(srcAny&&dstAny) issues.push({rule_id:r.id,rule_name:r.name,issue:'ANY/ANY rule',severity:'Critical',action:'IMMEDIATE_REVIEW'});\n  else if(srcAny&&['22','3389','1433'].includes(String(r.port))) issues.push({rule_id:r.id,rule_name:r.name,issue:`Port ${r.port} open to any source`,severity:'High',action:'RESTRICT_SOURCE'});\n  else if(lastUsed>90) issues.push({rule_id:r.id,rule_name:r.name,issue:`Unused for ${lastUsed} days`,severity:'Low',action:'REVIEW_AND_REMOVE'});\n}\nreturn[{json:{total_rules:rules.length,issues,critical:issues.filter(i=>i.severity==='Critical').length,high:issues.filter(i=>i.severity==='High').length,unused:issues.filter(i=>i.action==='REVIEW_AND_REMOVE').length,audited_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "n1-jira",
+      "name": "Create Audit Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "NETWORK",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[FW-AUDIT] {{ $json.critical }} Critical, {{ $json.high }} High issues \u2014 {{ $json.audited_at.split('T')[0] }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.critical>0?'High':'Medium' }}"
+          },
+          "labels": [
+            "firewall",
+            "network",
+            "hygiene"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "n1-slack",
+      "name": "Audit Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_NETWORK_SEC"
+        },
+        "text": "\ud83c\udf10 *Firewall Rule Audit*\n\n*Total Rules:* {{ $json.total_rules }}\n*Issues:* {{ $json.issues.length }} ({{ $json.critical }} Critical, {{ $json.high }} High)\n*Unused Rules:* {{ $json.unused }}\n\n{{ $json.issues.filter(i=>['Critical','High'].includes(i.severity)).slice(0,5).map(i=>(i.severity==='Critical'?'\ud83d\udd34':'\u26a0\ufe0f')+' Rule: '+i.rule_name+' \u2014 '+i.issue).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Wednesday 06:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Firewall Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Firewall Rules": {
+      "main": [
+        [
+          {
+            "node": "Audit Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Rules": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Audit Ticket": {
+      "main": [
+        [
+          {
+            "node": "Audit Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "network",
+    "workflow_id": "NET-01",
+    "phase": 2,
+    "description": "Weekly: pulls ACLs from firewall API. Flags any/any rules, unused rules >90 days, overly broad CIDR blocks. Creates cleanup tickets."
+  }
+}

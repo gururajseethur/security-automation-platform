@@ -1,0 +1,197 @@
+{
+  "name": "\ud83c\udf93 AWR-02 | Security Training Compliance Monitor",
+  "nodes": [
+    {
+      "id": "a2-cron",
+      "name": "Daily 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a2-kb4",
+      "name": "Fetch KnowBe4 Training Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "url": "=https://us.api.knowbe4.com/v1/training/enrollments?status=In+Progress",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.knowbe4Api.token }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "KB4_API",
+          "name": "KnowBe4 API"
+        }
+      }
+    },
+    {
+      "id": "a2-classify",
+      "name": "Classify Overdue Learners",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst enrollments=$input.first().json||[];\nconst now=Date.now();\nconst overdue_7=[];const overdue_14=[];\nfor(const e of enrollments){\n  const enrolled_days=Math.floor((now-new Date(e.enrollment_date||Date.now()))/86400000);\n  if(enrolled_days>=14) overdue_14.push({...e,days_enrolled:enrolled_days,action:'MANAGER_ESCALATION'});\n  else if(enrolled_days>=7) overdue_7.push({...e,days_enrolled:enrolled_days,action:'HR_JIRA'});\n}\nreturn[{json:{overdue_7,overdue_14,total_overdue:overdue_7.length+overdue_14.length,\n  needs_action:overdue_7.length>0||overdue_14.length>0,checked_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "a2-jira",
+      "name": "Create HR Compliance Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "HR",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[TRAINING] {{ $json.total_overdue }} staff overdue on security training \u2014 {{ $json.checked_at.split('T')[0] }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.overdue_14.length>0?'High':'Medium' }}"
+          },
+          "labels": [
+            "training",
+            "compliance",
+            "security"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "a2-slack",
+      "name": "Training Compliance Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SECURITY_AWARENESS"
+        },
+        "text": "=\ud83c\udf93 *Security Training Compliance*\n\n*Total Overdue:* {{ $json.total_overdue }}\n*Needs HR Jira (7d):* {{ $json.overdue_7.length }}\n*Manager Escalation (14d):* {{ $json.overdue_14.length }}\n\n{{ $json.overdue_14.slice(0,3).map(e=>'\u26a0\ufe0f '+e.user?.first_name+' '+e.user?.last_name+' \u2014 '+e.days_enrolled+'d overdue: '+e.training_campaign_name).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 09:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch KnowBe4 Training Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch KnowBe4 Training Status": {
+      "main": [
+        [
+          {
+            "node": "Classify Overdue Learners",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Overdue Learners": {
+      "main": [
+        [
+          {
+            "node": "Create HR Compliance Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create HR Compliance Ticket": {
+      "main": [
+        [
+          {
+            "node": "Training Compliance Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "awareness",
+    "workflow_id": "AWR-02",
+    "phase": 1,
+    "description": "Checks KnowBe4/Proofpoint training completion daily. Non-complete at 7 days \u2192 HR Jira. Non-complete at 14 days \u2192 manager escalation."
+  }
+}

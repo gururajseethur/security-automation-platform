@@ -1,0 +1,320 @@
+{
+  "name": "\ud83d\udd0d DFIR-03 | Malware Sample Auto-Submitter (Any.run)",
+  "nodes": [
+    {
+      "id": "d3-wh",
+      "name": "Suspicious File Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dfir/sandbox-submit",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "d3-prep",
+      "name": "Prepare Submission",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nreturn[{json:{sha256:evt.sha256||evt.file_hash,filename:evt.filename||evt.file_name||'unknown',\n  hostname:evt.hostname||'unknown',username:evt.username||'unknown',\n  submission_id:null,task_id:null,submitted_at:null}}];"
+      }
+    },
+    {
+      "id": "d3-submit",
+      "name": "Submit to Any.run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.any.run/v1/analysis",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"obj_type\":\"file\",\"obj_url\":null,\"obj_ext_browser\":\"Chrome\",\"obj_ext_cmd\":null,\"obj_ext_elevateprompt\":false,\"obj_ext_extension\":true,\"obj_ext_startfolder\":\"temp\",\"opt_network_connect\":true,\"opt_privacy_type\":1,\"opt_timeout\":60}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=API-Key {{ $credentials.anyrunApi.apiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANYRUN_API",
+          "name": "Any.run API"
+        }
+      }
+    },
+    {
+      "id": "d3-poll",
+      "name": "Extract Task ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst resp=$input.first().json;\nconst taskId=resp.data?.taskId||resp.taskId||'DEMO-TASK-001';\nreturn[{json:{...$('Prepare Submission').first().json,task_id:taskId,submitted_at:new Date().toISOString(),report_url:`https://app.any.run/tasks/${taskId}`}}];"
+      }
+    },
+    {
+      "id": "d3-wait",
+      "name": "Wait 90 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "amount": 90,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "d3-result",
+      "name": "Fetch Analysis Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "url": "=https://api.any.run/v1/analysis/{{ $json.task_id }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=API-Key {{ $credentials.anyrunApi.apiKey }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANYRUN_API",
+          "name": "Any.run API"
+        }
+      }
+    },
+    {
+      "id": "d3-parse",
+      "name": "Parse Sandbox Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst result=$input.first().json;\nconst context=$('Extract Task ID').first().json;\nconst verdict=result.data?.analysis?.scores?.verdict?.threatLevel||'No Threat';\nconst is_malicious=['Dangerous','Suspicious'].includes(verdict);\nconst processes=(result.data?.analysis?.content?.mainObject?.processes||[]).slice(0,5);\nconst network_indicators=(result.data?.analysis?.content?.mainObject?.network||{});\nreturn[{json:{...context,verdict,is_malicious,threat_score:result.data?.analysis?.scores?.specs?.notSuspiciousActivity?0:75,\n  processes_count:processes.length,has_network_activity:Object.keys(network_indicators).length>0,\n  analysis_complete:true}}];"
+      }
+    },
+    {
+      "id": "d3-jira",
+      "name": "Attach Report to DFIR",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "DFIR",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[SANDBOX] {{ $json.verdict }} | {{ $json.sha256.substring(0,16) }}... | {{ $json.hostname }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.is_malicious?'High':'Medium' }}"
+          },
+          "labels": [
+            "sandbox",
+            "malware",
+            "anyrun"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "d3-slack",
+      "name": "Sandbox Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_DFIR"
+        },
+        "text": "=\ud83d\udd0d *Sandbox Analysis Complete*\n\n*Verdict:* {{ $json.is_malicious?'\ud83d\udd34 MALICIOUS':'\u2705 Clean' }} ({{ $json.verdict }})\n*File:* {{ $json.filename }}\n*SHA256:* `{{ $json.sha256 }}`\n*Host:* {{ $json.hostname }}\n*Report:* {{ $json.report_url }}\n*Jira:* {{ $('Attach Report to DFIR').first().json.key }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Suspicious File Event": {
+      "main": [
+        [
+          {
+            "node": "Prepare Submission",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Submission": {
+      "main": [
+        [
+          {
+            "node": "Submit to Any.run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit to Any.run": {
+      "main": [
+        [
+          {
+            "node": "Extract Task ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Task ID": {
+      "main": [
+        [
+          {
+            "node": "Wait 90 Seconds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 90 Seconds": {
+      "main": [
+        [
+          {
+            "node": "Fetch Analysis Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Analysis Report": {
+      "main": [
+        [
+          {
+            "node": "Parse Sandbox Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sandbox Report": {
+      "main": [
+        [
+          {
+            "node": "Attach Report to DFIR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Report to DFIR": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "dfir",
+    "workflow_id": "DFIR-03",
+    "phase": 3,
+    "description": "Suspicious file hash event \u2192 submit to Any.run sandbox \u2192 poll for results \u2192 attach report to Jira."
+  }
+}

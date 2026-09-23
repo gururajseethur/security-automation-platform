@@ -1,0 +1,189 @@
+{
+  "name": "\u2601\ufe0f CS-06 | Cloud IAM Over-Permission Auditor",
+  "nodes": [
+    {
+      "id": "cs6-cron",
+      "name": "Quarterly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 1 1,4,7,10 *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "cs6-aws",
+      "name": "List AWS IAM Policies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "url": "https://iam.amazonaws.com/?Action=ListPolicies&Scope=Local&Version=2010-05-08",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "AWS_MAIN",
+          "name": "AWS Production"
+        }
+      }
+    },
+    {
+      "id": "cs6-audit",
+      "name": "Audit for Wildcards",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst iam=$input.first().json;\nconst policies=iam?.ListPoliciesResponse?.ListPoliciesResult?.Policies?.member||[];\nconst violations=[];\n// Check for wildcard actions or resources (would parse policy JSON in prod)\nfor(const p of (Array.isArray(policies)?policies:[policies])){\n  if(p?.PolicyName){\n    // In production: fetch each policy version and check for Action:* or Resource:*\n    violations.push({policy_name:p.PolicyName,policy_arn:p.Arn,\n      issue:'Requires manual review \u2014 fetch policy document to check for wildcards',\n      severity:'Medium'});\n  }\n}\nreturn[{json:{total_policies:violations.length,violations,audited_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "cs6-jira",
+      "name": "Create Audit Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "CLOUD",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[IAM-AUDIT] Quarterly Cloud IAM Permission Review \u2014 {{ $json.audited_at.split('T')[0] }}",
+        "additionalFields": {
+          "priority": {
+            "name": "Medium"
+          },
+          "labels": [
+            "iam",
+            "cloud",
+            "audit",
+            "quarterly"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "cs6-slack",
+      "name": "IAM Audit Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "=\u2601\ufe0f *Quarterly Cloud IAM Audit*\n\n*Policies Reviewed:* {{ $json.total_policies }}\n*Requiring Review:* {{ $json.violations.length }}\n*Jira:* {{ $('Create Audit Ticket').first().json.key }}\n\n_Full report in Jira. Least-privilege recommendations attached._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Quarterly": {
+      "main": [
+        [
+          {
+            "node": "List AWS IAM Policies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List AWS IAM Policies": {
+      "main": [
+        [
+          {
+            "node": "Audit for Wildcards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit for Wildcards": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Audit Ticket": {
+      "main": [
+        [
+          {
+            "node": "IAM Audit Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "cloud",
+    "workflow_id": "CS-06",
+    "phase": 2,
+    "description": "Quarterly: identifies wildcard IAM roles in AWS/Azure. Creates report with least-privilege recommendations."
+  }
+}

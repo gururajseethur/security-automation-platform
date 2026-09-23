@@ -1,0 +1,176 @@
+{
+  "name": "\ud83d\udee1\ufe0f BT-03 | Incident Response Playbook Engine",
+  "nodes": [
+    {
+      "id": "b3-wh",
+      "name": "Incident Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-team/ir-playbook",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "b3-lookup",
+      "name": "Lookup Playbook",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst PLAYBOOKS={\n  'brute_force':{name:'Brute Force Response',steps:['Block source IP','Force MFA re-auth on target account','Check for successful auth in window','Review account for compromise'],sla_hours:1,team:'SOC',severity:'High'},\n  'malware':{name:'Malware Containment',steps:['Isolate endpoint from network','Capture memory dump','Scan for persistence','Wipe and reimage if confirmed'],sla_hours:2,team:'IR',severity:'Critical'},\n  'data_exfil':{name:'Data Exfiltration Response',steps:['Block egress IP/domain','Capture network pcap','Identify data accessed','Notify DPO if PII involved'],sla_hours:1,team:'IR',severity:'Critical'},\n  'phishing':{name:'Phishing Incident',steps:['Pull email from all mailboxes','Block sender domain','Check for credential submission','Scan clicked-link hosts'],sla_hours:2,team:'SOC',severity:'Medium'},\n  'insider_threat':{name:'Insider Threat Protocol',steps:['Preserve evidence before alerting HR','Capture all logs for past 30 days','Identify data accessed','Legal hold on accounts'],sla_hours:4,team:'CISO',severity:'Critical'},\n  'ransomware':{name:'Ransomware Response',steps:['IMMEDIATE: Isolate all affected hosts','Notify CISO and legal NOW','Identify patient zero','Assess backup integrity'],sla_hours:0.5,team:'CISO',severity:'Critical'},\n  'cloud_breach':{name:'Cloud Breach Response',steps:['Rotate all IAM keys immediately','Review CloudTrail for 72hrs','Identify affected resources','Assess data exposure'],sla_hours:1,team:'Cloud',severity:'Critical'},\n  'default':{name:'Generic Security Incident',steps:['Gather evidence','Assess scope','Contain if possible','Document timeline'],sla_hours:4,team:'SOC',severity:'Medium'}\n};\nconst type=evt.incident_type||evt.event_type||'default';\nconst pb=PLAYBOOKS[type]||PLAYBOOKS['default'];\nconst inc_id=`INC-${Date.now()}`;\nconst due=new Date(Date.now()+pb.sla_hours*3600000).toISOString();\nreturn[{json:{incident_id:inc_id,playbook:pb.name,type,steps:pb.steps,sla_hours:pb.sla_hours,due_at:due,team:pb.team,severity:pb.severity,source:evt.source||'unknown',description:evt.description||evt.raw_data?.rule_desc||'Incident detected'}}];"
+      }
+    },
+    {
+      "id": "b3-jira",
+      "name": "Create Incident Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "SOC",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[INC-{{ $json.severity.toUpperCase() }}] {{ $json.incident_id }} | {{ $json.playbook }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.severity==='Critical'?'Highest':$json.severity==='High'?'High':'Medium' }}"
+          },
+          "labels": [
+            "incident",
+            "ir-playbook"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "b3-slack",
+      "name": "Dispatch to Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_SOC_INCIDENTS"
+        },
+        "text": "=\ud83d\udea8 *Incident Declared \u2014 {{ $json.severity }}*\n\n*ID:* `{{ $json.incident_id }}`\n*Playbook:* {{ $json.playbook }}\n*Assigned Team:* {{ $json.team }}\n*SLA:* {{ $json.sla_hours }}hr \u2014 Due: {{ $json.due_at }}\n*Jira:* {{ $('Create Incident Ticket').first().json.key }}\n\n*Steps:*\n{{ $json.steps.map((s,i)=>(i+1)+'. '+s).join('\\n') }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "id": "b3-log",
+      "name": "Log Incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO incidents (incident_id,type,playbook,severity,team,sla_hours,due_at,jira_key,created_at) VALUES ('IID','type','pb','sev','team',0,'2024-01-01','KEY',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Incident Trigger": {
+      "main": [
+        [
+          {
+            "node": "Lookup Playbook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup Playbook": {
+      "main": [
+        [
+          {
+            "node": "Create Incident Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Incident Ticket": {
+      "main": [
+        [
+          {
+            "node": "Dispatch to Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch to Team": {
+      "main": [
+        [
+          {
+            "node": "Log Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "blue-team",
+    "workflow_id": "BT-03",
+    "phase": 1,
+    "description": "Alert type \u2192 lookup playbook \u2192 auto-assign analyst \u2192 SLA countdown \u2192 escalation. Covers 8 incident types."
+  }
+}

@@ -1,0 +1,319 @@
+{
+  "name": "\u2601\ufe0f CS-01 | Cloud Misconfiguration Scanner",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */4 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cs-cron-01",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://ec2.amazonaws.com/?Action=DescribeSecurityGroups&Version=2016-11-15",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=AWS4-HMAC-SHA256 Credential={{ $credentials.aws.accessKeyId }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "cs-sg-02",
+      "name": "Fetch AWS Security Groups",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        200
+      ],
+      "credentials": {
+        "aws": {
+          "id": "AWS_MAIN",
+          "name": "AWS Production"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://s3.amazonaws.com/?list-type=2",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=AWS4-HMAC-SHA256 Credential={{ $credentials.aws.accessKeyId }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "cs-s3-03",
+      "name": "Fetch S3 Buckets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        420,
+        380
+      ],
+      "credentials": {
+        "aws": {
+          "id": "AWS_MAIN",
+          "name": "AWS Production"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Simulate findings analysis \u2014 in production parse actual AWS API XML responses\nconst sgData=$('Fetch AWS Security Groups').first().json;\nconst s3Data=$('Fetch S3 Buckets').first().json;\n\n// Pattern: detect 0.0.0.0/0 on sensitive ports\nconst HIGH_RISK_PORTS=[22,3389,1433,3306,5432,6379,27017,9200];\n\n// Mock findings structure (replace with actual XML parsing in prod)\nconst findings=[\n  // These would be parsed from actual AWS API responses\n  // Example finding structure:\n  {type:'PUBLIC_SG',resource:'sg-0abc123',detail:'Port 22 open to 0.0.0.0/0',severity:'High',service:'EC2',remediation:'Restrict to specific IP ranges or use AWS Systems Manager Session Manager'},\n  {type:'S3_PUBLIC',resource:'s3-exports-tmp',detail:'Bucket ACL allows public read',severity:'Critical',service:'S3',remediation:'Set bucket ACL to private and enable Block Public Access'}\n];\n\nconst critical=findings.filter(f=>f.severity==='Critical');\nconst high=findings.filter(f=>f.severity==='High');\n\nreturn[{json:{findings,critical_count:critical.length,high_count:high.length,total:findings.length,has_critical:critical.length>0,scan_timestamp:new Date().toISOString()}}];"
+      },
+      "id": "cs-analyse-04",
+      "name": "Analyse Findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "has-findings",
+              "leftValue": "={{ $json.total }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "cs-gate-05",
+      "name": "Findings?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "CLOUD",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Finding",
+          "mode": "name"
+        },
+        "summary": "=[CS-SCAN] {{ $json.critical_count }} Critical, {{ $json.high_count }} High cloud misconfigurations detected",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.has_critical ? 'Highest' : 'High' }}"
+          },
+          "labels": [
+            "cloud",
+            "misconfiguration",
+            "auto-scan"
+          ]
+        }
+      },
+      "id": "cs-jira-06",
+      "name": "Create Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        200
+      ],
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_CLOUD_SEC"
+        },
+        "text": "={{ $json.has_critical ? '\ud83d\udea8' : '\u26a0\ufe0f' }} *Cloud Misconfig Scan \u2014 {{ $json.critical_count }} Critical, {{ $json.high_count }} High*\n\n{{ $json.findings.map(f => (f.severity==='Critical'?'\ud83d\udd34':'\u26a0\ufe0f') + ' [' + f.service + '] ' + f.resource + ': ' + f.detail + '\\n   Fix: ' + f.remediation).join('\\n\\n') }}\n\n*Scanned:* {{ $json.scan_timestamp }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "cs-slack-07",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        380
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "value": "public"
+        },
+        "table": {
+          "value": "cloud_scan_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "scan_timestamp": "={{ $json.scan_timestamp }}",
+            "critical_count": "={{ $json.critical_count }}",
+            "high_count": "={{ $json.high_count }}",
+            "total_findings": "={{ $json.total }}",
+            "findings_json": "={{ JSON.stringify($json.findings) }}"
+          }
+        }
+      },
+      "id": "cs-log-08",
+      "name": "Log Scan",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch AWS Security Groups",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch S3 Buckets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch AWS Security Groups": {
+      "main": [
+        [
+          {
+            "node": "Analyse Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch S3 Buckets": {
+      "main": [
+        [
+          {
+            "node": "Analyse Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse Findings": {
+      "main": [
+        [
+          {
+            "node": "Findings?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Findings?": {
+      "main": [
+        [
+          {
+            "node": "Create Jira",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Scan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "cloud",
+    "workflow_id": "CS-01",
+    "phase": 2
+  }
+}

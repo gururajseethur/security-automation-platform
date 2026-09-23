@@ -1,0 +1,177 @@
+{
+  "name": "\ud83d\udcbb EP-05 | USB Policy Violation Responder",
+  "nodes": [
+    {
+      "id": "e5-wh",
+      "name": "USB Event Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "endpoint/usb-event",
+        "responseMode": "lastNode"
+      }
+    },
+    {
+      "id": "e5-classify",
+      "name": "Classify USB Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst evt=$input.first().json?.raw_data||$input.first().json;\nconst has_sensitive_data=evt.data_classification&&['Confidential','Restricted','PII'].includes(evt.data_classification);\nconst large_transfer=parseInt(evt.bytes_transferred||0)>50*1024*1024; // >50MB\nconst severity=has_sensitive_data?'Critical':large_transfer?'High':'Medium';\nconst should_disable=has_sensitive_data&&evt.action==='write';\nreturn[{json:{hostname:evt.hostname||evt.device_name,username:evt.username||evt.user,\n  device_id:evt.usb_device_id||'unknown',action:evt.action||'connected',\n  bytes_transferred:evt.bytes_transferred||0,data_classification:evt.data_classification||'Unknown',\n  has_sensitive:has_sensitive_data,severity,should_disable,\n  event_time:evt.timestamp||new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "e5-log",
+      "name": "Log USB Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO usb_events (hostname,username,device_id,action,data_classification,severity,event_time) VALUES ('host','user','dev','action','class','sev',NOW()) ON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "e5-jira",
+      "name": "Create DLP Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "value": "DLP",
+          "mode": "list"
+        },
+        "issuetype": {
+          "value": "Security Alert",
+          "mode": "name"
+        },
+        "summary": "=[USB-{{ $json.severity.toUpperCase() }}] {{ $json.username }} @ {{ $json.hostname }} \u2014 {{ $json.action }}",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.severity==='Critical'?'Highest':$json.severity==='High'?'High':'Medium' }}"
+          },
+          "labels": [
+            "usb",
+            "dlp",
+            "endpoint"
+          ]
+        }
+      },
+      "credentials": {
+        "jiraApi": {
+          "id": "JIRA_MAIN",
+          "name": "Constellation Jira"
+        }
+      }
+    },
+    {
+      "id": "e5-slack",
+      "name": "USB Policy Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_ENDPOINT_SEC"
+        },
+        "text": "=\ud83d\udcbb *USB {{ $json.severity }} Event*\n\n*User:* {{ $json.username }}\n*Host:* {{ $json.hostname }}\n*Action:* {{ $json.action }}\n*Data Class:* {{ $json.data_classification }}\n*Bytes:* {{ Math.round(parseInt($json.bytes_transferred||0)/1024/1024) }}MB\n*USB Disable:* {{ $json.should_disable?'\ud83d\udd34 TRIGGERED':'\u274c Not triggered' }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "USB Event Webhook": {
+      "main": [
+        [
+          {
+            "node": "Classify USB Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify USB Event": {
+      "main": [
+        [
+          {
+            "node": "Log USB Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log USB Event": {
+      "main": [
+        [
+          {
+            "node": "Create DLP Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create DLP Ticket": {
+      "main": [
+        [
+          {
+            "node": "USB Policy Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "endpoint",
+    "workflow_id": "EP-05",
+    "phase": 2,
+    "description": "DLP/EDR USB event \u2192 log + notify user + notify manager. If sensitive data detected: disable USB controller on host."
+  }
+}

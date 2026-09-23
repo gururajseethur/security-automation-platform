@@ -1,0 +1,169 @@
+{
+  "name": "\ud83c\udf10 NET-05 | Network Baseline Drift Detector",
+  "nodes": [
+    {
+      "id": "n5-cron",
+      "name": "Weekly Saturday 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * 6"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n5-baseline",
+      "name": "Get Current Baseline",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ip_address,open_ports_json,hostname,last_seen FROM network_baseline ORDER BY ip_address;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_MAIN",
+          "name": "Constellation DB"
+        }
+      }
+    },
+    {
+      "id": "n5-scan",
+      "name": "Run Network Scan (Nmap wrapper)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// Production: use n8n Execute Command node\n// nmap -sn 10.0.0.0/24 -oJ /tmp/hosts.json && nmap -sV --open -T3 -iL /tmp/hosts.txt -oJ /tmp/ports.json\n// Mock structure \u2014 replace with actual nmap JSON parsing\nconst baseline=$input.all().map(i=>i.json);\nconst current=[{ip:'10.0.1.10',hostname:'prod-web-01',ports:[{port:443,service:'https'},{port:80,service:'http'}]},\n               {ip:'10.0.1.20',hostname:'prod-db-01',ports:[{port:5432,service:'postgres'},{port:22,service:'ssh'}]}];\nconst baselineMap={};\nbaseline.forEach(h=>{baselineMap[h.ip_address]=JSON.parse(h.open_ports_json||'[]');});\nconst changes=[];\nfor(const host of current){\n  const prevPorts=(baselineMap[host.ip]||[]).map(p=>p.port);\n  const currPorts=host.ports.map(p=>p.port);\n  const newPorts=currPorts.filter(p=>!prevPorts.includes(p));\n  if(newPorts.length>0)changes.push({ip:host.ip,hostname:host.hostname,type:'NEW_PORT',detail:`New ports: ${newPorts.join(', ')}`,severity:'High'});\n}\nreturn[{json:{hosts_scanned:current.length,changes,change_count:changes.length,scanned_at:new Date().toISOString()}}];"
+      }
+    },
+    {
+      "id": "n5-gate",
+      "name": "Drift Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "c-n5-gate",
+              "leftValue": "={{ $json.change_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n5-slack",
+      "name": "Drift Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "value": "C_NETWORK_SEC"
+        },
+        "text": "=\ud83c\udf10 *Network Baseline Drift*\n\n*Hosts Scanned:* {{ $json.hosts_scanned }}\n*Changes Detected:* {{ $json.change_count }}\n\n{{ $json.changes.map(c=>'\ud83d\udd34 '+c.ip+' ('+c.hostname+') \u2014 '+c.detail).join('\\n') }}\n\n_Verify change control before investigating._",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_MAIN",
+          "name": "Constellation Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Saturday 02:00": {
+      "main": [
+        [
+          {
+            "node": "Get Current Baseline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Current Baseline": {
+      "main": [
+        [
+          {
+            "node": "Run Network Scan (Nmap wrapper)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Network Scan (Nmap wrapper)": {
+      "main": [
+        [
+          {
+            "node": "Drift Detected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drift Detected?": {
+      "main": [
+        [
+          {
+            "node": "Drift Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "ORCH-02"
+  },
+  "meta": {
+    "constellation_version": "1.2",
+    "domain": "network",
+    "workflow_id": "NET-05",
+    "phase": 2,
+    "description": "Weekly Nmap scan vs saved baseline. Alerts on new open ports, new hosts, or disappeared hosts."
+  }
+}
